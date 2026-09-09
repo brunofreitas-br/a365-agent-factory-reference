@@ -319,7 +319,6 @@ Configure as variáveis:
 | `AGENT_FACTORY_PRINCIPAL_ID` | object ID do service principal do pipeline |
 | `AGENT_OWNER_OBJECT_IDS` | object IDs dos responsáveis, separados por vírgula |
 | `A365_AGENT_REGISTRATION_ENABLED` | `true` |
-| `A365_UNATTENDED_VERIFIED` | `true` |
 
 Exemplo:
 

@@ -47,6 +47,23 @@ jobs:
               return;
             }
 
+            const labels = [
+              { name: 'revisao-agente', color: '2C6BD6', description: 'Revisão periódica de agente' },
+              { name: 'a365', color: '0B1222', description: 'Microsoft Agent 365' },
+            ];
+            for (const label of labels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner, repo: context.repo.repo, name: label.name,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner, repo: context.repo.repo, ...label,
+                });
+              }
+            }
+
             // Reabrir a mesma issue toda semana viraria ruído e ninguém leria nenhuma.
             const abertas = await github.paginate(github.rest.issues.listForRepo, {
               owner: context.repo.owner,
