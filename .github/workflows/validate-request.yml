@@ -1,0 +1,77 @@
+name: Validar solicitação
+
+# Gates 1 e 3: schema, política e dry-run. Nada aqui altera estado no tenant ou no Azure.
+on:
+  pull_request:
+    paths:
+      - 'requests/**.yaml'
+      - 'scripts/**.py'
+      - 'template/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install --disable-pip-version-check pyyaml jsonschema
+
+      - name: Identificar solicitações alteradas
+        id: changed
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          files="$(git diff --name-only --diff-filter=d "$base" "$head" -- 'requests/*.yaml' | tr '\n' ' ')"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+          if [ -z "$files" ]; then
+            echo "Nenhuma solicitação alterada neste PR."
+          else
+            echo "Solicitações alteradas: $files"
+          fi
+
+      - name: Gate 1 — schema e política
+        if: steps.changed.outputs.files != ''
+        run: python scripts/validate_request.py ${{ steps.changed.outputs.files }}
+
+      - name: Gate 3 — renderizar artefatos (dry-run)
+        if: steps.changed.outputs.files != ''
+        run: |
+          set -euo pipefail
+          for f in ${{ steps.changed.outputs.files }}; do
+            echo "::group::Renderizando $f"
+            python scripts/render_request.py "$f" --out build/
+            echo "::endgroup::"
+          done
+
+      - name: Prévia do registro no inventário M365 (dry-run)
+        if: steps.changed.outputs.files != ''
+        run: |
+          set -euo pipefail
+          for f in ${{ steps.changed.outputs.files }}; do
+            slug="$(python -c "import sys,yaml;print(yaml.safe_load(open(sys.argv[1]))['agent_name'])" "$f")"
+            echo "::group::agentRegistration para $slug"
+            python scripts/register_agent.py "build/$slug/agent/agent_manifest.json" \
+              --created-by "00000000-0000-0000-0000-000000000000" --dry-run
+            echo "::endgroup::"
+          done
+
+      - name: Publicar artefatos renderizados
+        if: steps.changed.outputs.files != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-renderizado
+          path: build/
+          retention-days: 7

@@ -1,0 +1,82 @@
+name: Intake de solicitação
+
+# Caminho Único do intake. O conector do GitHub no Power Automate NÃO tem ação para
+# escrever arquivo (só "Create or update a repository SECRET"), então o flow não consegue
+# criar o YAML. Ele dispara UM evento e todo o trabalho de repositório acontece aqui.
+#
+# A aprovação humana já aconteceu no Power Automate Approvals antes do dispatch.
+on:
+  repository_dispatch:
+    types: [nova-solicitacao-agente]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  abrir-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install --disable-pip-version-check pyyaml jsonschema
+
+      - name: Montar a solicitação a partir do payload
+        id: montar
+        # O payload vem de um formulário aberto a makers. Ele é lido do arquivo de
+        # evento em Python — nunca interpolado em shell ou em YAML por concatenação.
+        run: python scripts/intake_from_dispatch.py
+
+      - name: Validar (Gate 1)
+        id: validar
+        continue-on-error: true
+        run: python scripts/validate_request.py "requests/${{ steps.montar.outputs.slug }}.yaml"
+
+      - name: Abrir e mesclar o PR
+        env:
+          # GITHUB_TOKEN basta porque a validação roda AQUI DENTRO, não via trigger
+          # `pull_request` — que o GITHUB_TOKEN não dispararia. E o provisionamento é
+          # acionado por `workflow_run` deste workflow, não pelo push do merge.
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.montar.outputs.slug }}
+          DISPLAY_NAME: ${{ steps.montar.outputs.display_name }}
+          REQUESTER: ${{ steps.montar.outputs.requester }}
+          VALIDACAO: ${{ steps.validar.outcome }}
+        run: |
+          set -euo pipefail
+          branch="solicitacao/${SLUG}"
+
+          git config user.name  "agent-factory[bot]"
+          git config user.email "agent-factory@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add "requests/${SLUG}.yaml"
+          git commit -m "Solicitação de agente: ${SLUG}"
+          # Branch de intake é descartável: uma tentativa anterior pode ter deixado
+          # sobra, e o checkout raso não conhece o estado remoto para --force-with-lease.
+          git push origin --delete "$branch" 2>/dev/null || true
+          git push origin "$branch"
+
+          if [ "$VALIDACAO" = "success" ]; then
+            corpo="Aprovado no intake por ${REQUESTER} e validado automaticamente."
+          else
+            corpo="A validação automatica FALHOU — veja o log desta execução. O PR fica aberto para o solicitante enxergar o motivo, e NÃO será mesclado."
+          fi
+
+          url=$(gh pr create --base main --head "$branch" \
+            --title "Solicitação de agente: ${DISPLAY_NAME}" --body "$corpo")
+          echo "PR: $url"
+
+          if [ "$VALIDACAO" != "success" ]; then
+            echo "::error::Solicitação inválida. PR aberto sem merge: $url"
+            exit 1
+          fi
+
+          gh pr merge "$url" --squash --delete-branch \
+            --subject "Provisionar agente: ${SLUG}" \
+            --body "Aprovado no intake via Power Automate Approvals."
+          echo "PR mesclado. O provisionamento começa agora."

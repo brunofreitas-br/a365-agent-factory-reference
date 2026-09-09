@@ -1,0 +1,28 @@
+# Artefatos renderizados pelo pipeline
+build/
+
+# Cache de detecção das skills do A365 — estado local por máquina, nunca commitar
+.a365-workspace-detection.local.json
+
+# Config gerado pelo a365 CLI com valores de assinatura/tenant
+a365.generated.config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Segredos — nenhum destes deve existir no repo, mas o gitignore é a última barreira
+*.env
+.env*
+!.env.example
+*.pem
+*.pfx
+secrets.json
+
+# macOS / editores
+.DS_Store
+.vscode/settings.json

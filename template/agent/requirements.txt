@@ -1,0 +1,24 @@
+# Runtime do agente
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+
+# Orquestração
+langgraph==0.2.60
+langchain-core==0.3.28
+langchain-openai==0.2.14
+
+# Auth no Azure OpenAI por managed identity (sem API key)
+azure-identity==1.19.0
+
+# Observabilidade A365 (exportação OTLP para o endpoint S2S)
+opentelemetry-sdk==1.29.0
+opentelemetry-api==1.29.0
+httpx==0.28.1
+
+# Instrumentação automática do FastAPI (spans de requisição)
+opentelemetry-instrumentation-fastapi==0.50b0
+
+# Destino: substituir o observability.py próprio pelo SDK oficial quando a skill
+# `instrument-observability` gerar a fiação.
+#   microsoft-agents-a365-observability-core>=0.2.0.dev0

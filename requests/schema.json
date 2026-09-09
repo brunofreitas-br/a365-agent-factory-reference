@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-factory:schemas:request:1",
+  "title": "Solicitação de agente (Agent Factory)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "agent_name",
+    "display_name",
+    "purpose",
+    "business_owner",
+    "technical_owner",
+    "agent_kind",
+    "auth_mode",
+    "environment",
+    "data_sensitivity",
+    "writes",
+    "autonomous",
+    "audience",
+    "review_date"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "agent_name": {
+      "type": "string",
+      "description": "Slug. Vira nome de recurso no Azure e do diretório renderizado.",
+      "pattern": "^[a-z][a-z0-9-]{2,38}[a-z0-9]$"
+    },
+    "display_name": { "type": "string", "minLength": 3, "maxLength": 60 },
+    "purpose": {
+      "type": "string",
+      "minLength": 30,
+      "maxLength": 600,
+      "description": "Descrição em prosa. Mínimo de 30 caracteres para impedir 'teste'."
+    },
+    "business_owner": { "type": "string", "format": "email" },
+    "technical_owner": { "type": "string", "format": "email" },
+    "agent_kind": { "enum": ["agent", "ai-teammate"] },
+    "auth_mode": { "enum": ["s2s", "obo"] },
+    "environment": { "enum": ["dev", "prod"] },
+    "data_sensitivity": { "enum": ["publico", "interno", "confidencial", "restrito"] },
+    "writes": { "type": "boolean" },
+    "autonomous": { "type": "boolean" },
+    "audience": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "format": "email" }
+    },
+    "workiq_tools": {
+      "type": "array",
+      "items": {
+        "enum": ["mail", "calendar", "teams", "sharepoint", "onedrive", "word", "user", "copilot", "dataverse"]
+      },
+      "default": []
+    },
+    "review_date": { "type": "string", "format": "date" }
+  }
+}

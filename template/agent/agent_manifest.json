@@ -1,0 +1,14 @@
+{
+  "agentName": "template-agent",
+  "displayName": "Template Agent",
+  "purpose": "Placeholder. O pipeline sobrescreve este arquivo com a solicitação aprovada em requests/<agente>.yaml.",
+  "authMode": "s2s",
+  "environment": "dev",
+  "dataSensitivity": "interno",
+  "writes": false,
+  "autonomous": false,
+  "businessOwner": "nao-definido@exemplo.com",
+  "technicalOwner": "nao-definido@exemplo.com",
+  "audience": [],
+  "reviewDate": "2099-01-01"
+}

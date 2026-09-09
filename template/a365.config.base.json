@@ -1,0 +1,20 @@
+{
+  "_comment": "Schema canonico do a365 CLI v1.1.132-preview, obtido rodando `a365 config init` de verdade. Campos vazios sao preenchidos por scripts/render_request.py a partir da solicitacao e de variaveis de ambiente. needDeployment=false significa hospedagem externa (Container App) - nesse modo o CLI NAO exige AppServicePlanName nem WebAppName.",
+  "tenantId": "",
+  "subscriptionId": "",
+  "resourceGroup": "",
+  "location": "eastus",
+  "environment": "prod",
+  "messagingEndpoint": "",
+  "needDeployment": false,
+  "graphBaseUrl": "https://graph.microsoft.com",
+  "clientAppId": "",
+  "agentIdentityDisplayName": "",
+  "agentBlueprintDisplayName": "",
+  "agentUserPrincipalName": "",
+  "agentUserDisplayName": "",
+  "managerEmail": "",
+  "agentUserUsageLocation": "US",
+  "deploymentProjectPath": "",
+  "agentDescription": ""
+}

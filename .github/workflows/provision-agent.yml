@@ -1,0 +1,211 @@
+name: Provisionar agente
+
+# Roda depois do merge, quando os Gates de política e aprovação já foram concluídos.
+# Autenticação por OIDC/federated credentials: nenhum segredo de cliente no repositório.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'requests/**.yaml'
+  # O merge feito pelo intake usa GITHUB_TOKEN, e push por GITHUB_TOKEN NÃO dispara
+  # workflows. Por isso o intake também aciona o provisionamento por `workflow_run`,
+  # que é imune a essa restrição.
+  workflow_run:
+    workflows: ["Intake de solicitação"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      request:
+        description: 'Caminho da solicitação, ex: requests/meu-agente.yaml'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+concurrency:
+  group: provisionar-agente
+  cancel-in-progress: false
+
+jobs:
+  provisionar:
+    runs-on: ubuntu-latest
+    # Só provisiona se o intake terminou bem. Intake que falhou na validação abriu um PR
+    # sem merge — não há o que provisionar.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    environment: a365-${{ vars.A365_ENVIRONMENT || 'dev' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install --disable-pip-version-check pyyaml jsonschema
+
+      - name: Identificar a solicitação
+        id: req
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.request }}" ]; then
+            files="${{ github.event.inputs.request }}"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            files="$(git diff --name-only --diff-filter=d HEAD^ HEAD -- 'requests/*.yaml' | tr '\n' ' ')"
+          else
+            files="$(git diff-tree --root --no-commit-id --name-only --diff-filter=d -r HEAD -- 'requests/*.yaml' | tr '\n' ' ')"
+          fi
+          files="$(echo "$files" | xargs)"
+          if [ -z "$files" ]; then
+            echo "Nada a provisionar."; echo "slug=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Uma solicitação por execução: provisionamento em lote esconde qual falhou.
+          count=$(echo "$files" | wc -w)
+          if [ "$count" -gt 1 ]; then
+            echo "::error::$count solicitações no mesmo commit. Separe em PRs distintos."; exit 1
+          fi
+          slug="$(python -c "import sys,yaml;print(yaml.safe_load(open(sys.argv[1]))['agent_name'])" "$files")"
+          echo "file=$files" >> "$GITHUB_OUTPUT"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+      - name: Revalidar (o merge não dispensa a checagem)
+        if: steps.req.outputs.slug != ''
+        run: python scripts/validate_request.py "${{ steps.req.outputs.file }}"
+
+      - name: Renderizar artefatos
+        if: steps.req.outputs.slug != ''
+        run: python scripts/render_request.py "${{ steps.req.outputs.file }}" --out build/
+
+      - name: Autenticar no Azure (OIDC)
+        if: steps.req.outputs.slug != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Blueprint + Entra Agent ID + Agent User, via Graph app-only.
+      # NÃO usamos o `a365` CLI aqui: ele abre um navegador para autenticação interativa.
+      # As permissões existem como application roles, então o Graph direto roda headless.
+      - name: Provisionar identidade (blueprint + Entra Agent ID)
+        id: identidade
+        if: steps.req.outputs.slug != ''
+        env:
+          A365_TENANT_DOMAIN: ${{ vars.A365_TENANT_DOMAIN }}
+        run: |
+          set -euo pipefail
+          python scripts/provision_identity.py \
+            "build/${{ steps.req.outputs.slug }}/agent/agent_manifest.json" \
+            --tenant-domain "${{ vars.A365_TENANT_DOMAIN }}" \
+            --secret-out "build/${{ steps.req.outputs.slug }}/blueprint-secret.json"
+
+      - name: Guardar o segredo do blueprint no Key Vault
+        if: steps.req.outputs.slug != '' && vars.BLUEPRINT_SECRET_KV_NAME != ''
+        run: |
+          set -euo pipefail
+          f="build/${{ steps.req.outputs.slug }}/blueprint-secret.json"
+          # O segredo nunca vai para log nem para artefato: sai do disco assim que entra no cofre.
+          az keyvault secret set --vault-name "${{ vars.BLUEPRINT_SECRET_KV_NAME }}" \
+            --name "blueprint-${{ steps.req.outputs.slug }}" \
+            --value "$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['blueprintClientSecret'])" "$f")" \
+            --output none
+          shred -u "$f" 2>/dev/null || rm -f "$f"
+          echo "segredo do blueprint guardado no Key Vault"
+
+      - name: Build da imagem no ACR
+        if: steps.req.outputs.slug != ''
+        working-directory: build/${{ steps.req.outputs.slug }}
+        run: |
+          set -euo pipefail
+          # az acr build compila no serviço: o runner não precisa de daemon Docker.
+          az acr build \
+            --registry "${{ vars.ACR_NAME }}" \
+            --image "${{ steps.req.outputs.slug }}:${{ github.sha }}" \
+            --image "${{ steps.req.outputs.slug }}:latest" \
+            --file Dockerfile .
+
+      - name: Deploy do Container App
+        id: deploy
+        if: steps.req.outputs.slug != ''
+        working-directory: build/${{ steps.req.outputs.slug }}
+        run: |
+          set -euo pipefail
+          # Container App exige a URI do SEGREDO, não a do cofre:
+          # https://<cofre>.vault.azure.net/secrets/<nome>. Só o cofre dá ContainerAppSecretKeyVaultUrlInvalid.
+          kv_uri="${{ vars.BLUEPRINT_SECRET_KV_URI }}"
+          secret_uri="${kv_uri%/}/secrets/blueprint-${{ steps.req.outputs.slug }}"
+
+          # Blueprint e identidade são POR AGENTE. Usar variável fixa do repositório aqui
+          # faz o agente exportar telemetria com a identidade de outro — pior que não exportar.
+          bp="${{ steps.identidade.outputs.blueprint_app_id }}"
+          aid="${{ steps.identidade.outputs.agent_identity_id }}"
+          if [ -z "$bp" ] || [ -z "$aid" ]; then
+            echo "::error::Provisionamento não devolveu blueprint_app_id/agent_identity_id."
+            exit 1
+          fi
+
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/containerapp.bicep \
+            --parameters @infra.params.json \
+            --parameters \
+              image="${{ vars.ACR_NAME }}.azurecr.io/${{ steps.req.outputs.slug }}:${{ github.sha }}" \
+              managedEnvironmentId="${{ vars.ACA_ENVIRONMENT_ID }}" \
+              acrLoginServer="${{ vars.ACR_NAME }}.azurecr.io" \
+              userAssignedIdentityId="${{ vars.AGENT_IDENTITY_ID }}" \
+              userAssignedIdentityClientId="${{ vars.AGENT_IDENTITY_CLIENT_ID }}" \
+              a365TenantId="${{ vars.AZURE_TENANT_ID }}" \
+              a365AgentInstanceId="$aid" \
+              a365BlueprintClientId="$bp" \
+              blueprintSecretKeyVaultUri="$secret_uri" \
+              azureOpenAiEndpoint="${{ vars.AZURE_OPENAI_ENDPOINT }}" \
+              azureOpenAiDeployment="${{ vars.AZURE_OPENAI_DEPLOYMENT }}"
+
+          # O nome do Container App é truncado em 32 caracteres, então montar a URL por
+          # convenção registra um endereço que não existe. O FQDN vem do recurso.
+          app_name=$(python -c "import json;print(json.load(open('infra.params.json'))['parameters']['containerAppName']['value'])")
+          fqdn=$(az containerapp show -n "$app_name" \
+            -g "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          if [ -z "$fqdn" ]; then
+            echo "::error::Container App '$app_name' subiu sem FQDN de ingress. Registrar sem endereço válido é pior que não registrar."
+            exit 1
+          fi
+          echo "fqdn=$fqdn" >> "$GITHUB_OUTPUT"
+          echo "Container App em https://$fqdn"
+
+      # Registro no inventário administrativo do M365 (Agent Registration API, /beta).
+      # É o que torna o agente visível e governável. NÃO há publicação em catálogo aqui:
+      # o catálogo entrega AI Teammates a usuários finais, e o Gate 1 recusa esse tipo.
+      - name: Registrar no inventário do M365
+        id: registro
+        if: steps.req.outputs.slug != '' && vars.A365_AGENT_REGISTRATION_ENABLED == 'true'
+        env:
+          A365_AGENT_INSTANCE_ID: ${{ steps.identidade.outputs.agent_identity_id }}
+          A365_BLUEPRINT_CLIENT_ID: ${{ steps.identidade.outputs.blueprint_app_id }}
+          AGENT_FACTORY_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python scripts/register_agent.py \
+            "build/${{ steps.req.outputs.slug }}/agent/agent_manifest.json" \
+            --created-by "${{ vars.AGENT_FACTORY_PRINCIPAL_ID }}" \
+            --owner-ids "${{ vars.AGENT_OWNER_OBJECT_IDS }}" \
+            --managed-by-app-id "${{ vars.AZURE_CLIENT_ID }}" \
+            --agent-url "https://${{ steps.deploy.outputs.fqdn }}/invoke"
+
+      - name: Guardar os artefatos do agente
+        if: steps.req.outputs.slug != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: artefatos-${{ steps.req.outputs.slug }}
+          path: |
+            build/${{ steps.req.outputs.slug }}/a365.config.json
+            build/${{ steps.req.outputs.slug }}/agent/agent_manifest.json
+            build/${{ steps.req.outputs.slug }}/agent/agent_registration.json
+          if-no-files-found: warn
+          retention-days: 30
+

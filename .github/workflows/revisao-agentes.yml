@@ -1,0 +1,98 @@
+name: Revisão periódica de agentes
+
+# Estágio 07 do waterfall. O provisionamento cria; nada destruía. Este workflow lê a
+# `review_date` de cada solicitação e abre uma issue quando ela vence, com os dois
+# donos marcados. Enquanto a issue estiver aberta, o agente está sem revisão em dia.
+on:
+  schedule:
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
+    inputs:
+      dias_de_antecedencia:
+        description: 'Avisar quantos dias antes do vencimento'
+        required: false
+        default: '7'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install --quiet pyyaml
+
+      - name: Levantar agentes com revisão vencida
+        run: |
+          python scripts/agentes_para_revisar.py \
+            --dias-de-antecedencia "${{ github.event.inputs.dias_de_antecedencia || 7 }}" \
+            --out vencidos.json
+
+      - name: Abrir issue para cada agente
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const vencidos = JSON.parse(fs.readFileSync('vencidos.json', 'utf8'));
+            if (vencidos.length === 0) {
+              core.info('Nenhum agente com revisão vencida.');
+              return;
+            }
+
+            // Reabrir a mesma issue toda semana viraria ruído e ninguém leria nenhuma.
+            const abertas = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'revisao-agente',
+              per_page: 100,
+            });
+            const jaAberta = new Set(abertas.map(i => i.title));
+
+            for (const a of vencidos) {
+              const title = `Revisão de agente: ${a.agent_name}`;
+              if (jaAberta.has(title)) {
+                core.info(`Já existe issue aberta para ${a.agent_name}.`);
+                continue;
+              }
+              const atraso = a.dias_de_atraso > 0
+                ? `**Vencida há ${a.dias_de_atraso} dia(s)** (${a.review_date}).`
+                : `Vence em ${a.review_date}.`;
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                labels: ['revisao-agente', 'a365'],
+                body: [
+                  `O agente **${a.display_name || a.agent_name}** chegou à data de revisão.`,
+                  '',
+                  atraso,
+                  '',
+                  `- **Propósito declarado:** ${a.purpose}`,
+                  `- **Dono de negócio:** ${a.business_owner}`,
+                  `- **Dono técnico:** ${a.technical_owner}`,
+                  `- **Ambiente:** ${a.environment} · **Dado:** ${a.data_sensitivity}`,
+                  `- **Escreve:** ${a.writes ? 'sim' : 'não'} · **Autônomo:** ${a.autonomous ? 'sim' : 'não'}`,
+                  `- **Solicitação:** \`requests/${a.arquivo}\``,
+                  '',
+                  '### Decidir uma das três',
+                  '1. **Continua como está** — atualize `review_date` na solicitação e feche esta issue.',
+                  '2. **Continua com mudanças** — abra PR alterando a solicitação (escopo, donos, dados).',
+                  '3. **Não é mais necessário** — descomissione.',
+                  '',
+                  '### Se for descomissionar, nesta ordem',
+                  'agent user → agent identity → principal do blueprint → blueprint → Container App → imagem no ACR → segredo no Key Vault.',
+                  '',
+                  '> A ordem importa: apagar o blueprint antes dos filhos deixa objetos órfãos no Entra.',
+                ].join('\n'),
+              });
+              core.info(`Issue aberta para ${a.agent_name}.`);
+            }

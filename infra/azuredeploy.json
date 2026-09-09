@@ -1,0 +1,259 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.42.1.51946",
+      "templateHash": "1387035330909460803"
+    }
+  },
+  "parameters": {
+    "namePrefix": {
+      "type": "string",
+      "defaultValue": "a365factory",
+      "minLength": 3,
+      "maxLength": 12,
+      "metadata": {
+        "description": "Prefixo em letras minúsculas e números, sem espaços. Usado nos nomes dos recursos."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Região Azure para a fundação compartilhada."
+      }
+    },
+    "pipelinePrincipalId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Object ID do service principal do pipeline. Deixe vazio para criar o RBAC depois."
+      }
+    },
+    "tags": {
+      "type": "object",
+      "defaultValue": {},
+      "metadata": {
+        "description": "Tags adicionais aplicadas aos recursos."
+      }
+    }
+  },
+  "variables": {
+    "suffix": "[uniqueString(subscription().subscriptionId, resourceGroup().id)]",
+    "commonTags": "[union(parameters('tags'), createObject('workload', 'agent-365-factory', 'managedBy', 'bicep'))]",
+    "acrPullRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')]",
+    "contributorRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')]",
+    "keyVaultSecretsOfficerRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7')]",
+    "keyVaultSecretsUserRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')]",
+    "readerRoleId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2023-09-01",
+      "name": "[format('log-{0}', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30,
+        "features": {
+          "enableLogAccessUsingOnlyResourcePermissions": true
+        },
+        "publicNetworkAccessForIngestion": "Enabled",
+        "publicNetworkAccessForQuery": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[format('cae-{0}', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', format('log-{0}', parameters('namePrefix'))), '2023-09-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', format('log-{0}', parameters('namePrefix'))), '2023-09-01').primarySharedKey]"
+          }
+        },
+        "zoneRedundant": false
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', format('log-{0}', parameters('namePrefix')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ContainerRegistry/registries",
+      "apiVersion": "2023-07-01",
+      "name": "[take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50)]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]",
+      "sku": {
+        "name": "Basic"
+      },
+      "properties": {
+        "adminUserEnabled": false,
+        "publicNetworkAccess": "Enabled",
+        "policies": {
+          "exportPolicy": {
+            "status": "enabled"
+          },
+          "quarantinePolicy": {
+            "status": "disabled"
+          },
+          "retentionPolicy": {
+            "days": 7,
+            "status": "disabled"
+          },
+          "trustPolicy": {
+            "status": "disabled",
+            "type": "Notary"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.KeyVault/vaults",
+      "apiVersion": "2023-07-01",
+      "name": "[take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24)]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]",
+      "properties": {
+        "tenantId": "[tenant().tenantId]",
+        "sku": {
+          "family": "A",
+          "name": "standard"
+        },
+        "accessPolicies": [],
+        "enableRbacAuthorization": true,
+        "enablePurgeProtection": true,
+        "enableSoftDelete": true,
+        "softDeleteRetentionInDays": 90,
+        "publicNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[format('id-{0}-agent', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]"
+    },
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[format('id-{0}-console', parameters('namePrefix'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('commonTags')]"
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50))]",
+      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50)), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-agent', parameters('namePrefix'))), variables('acrPullRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-agent', parameters('namePrefix'))), '2023-01-31').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[variables('acrPullRoleId')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-agent', parameters('namePrefix')))]",
+        "[resourceId('Microsoft.ContainerRegistry/registries', take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50))]",
+      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50)), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-console', parameters('namePrefix'))), variables('acrPullRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-console', parameters('namePrefix'))), '2023-01-31').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[variables('acrPullRoleId')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-console', parameters('namePrefix')))]",
+        "[resourceId('Microsoft.ContainerRegistry/registries', take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.KeyVault/vaults', take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24)), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-agent', parameters('namePrefix'))), variables('keyVaultSecretsUserRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-agent', parameters('namePrefix'))), '2023-01-31').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[variables('keyVaultSecretsUserRoleId')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-agent', parameters('namePrefix')))]",
+        "[resourceId('Microsoft.KeyVault/vaults', take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-console', parameters('namePrefix'))), variables('readerRoleId'))]",
+      "properties": {
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-console', parameters('namePrefix'))), '2023-01-31').principalId]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[variables('readerRoleId')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-console', parameters('namePrefix')))]"
+      ]
+    },
+    {
+      "condition": "[not(empty(parameters('pipelinePrincipalId')))]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, parameters('pipelinePrincipalId'), variables('contributorRoleId'))]",
+      "properties": {
+        "principalId": "[parameters('pipelinePrincipalId')]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[variables('contributorRoleId')]"
+      }
+    },
+    {
+      "condition": "[not(empty(parameters('pipelinePrincipalId')))]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.KeyVault/vaults', take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24)), parameters('pipelinePrincipalId'), variables('keyVaultSecretsOfficerRoleId'))]",
+      "properties": {
+        "principalId": "[parameters('pipelinePrincipalId')]",
+        "principalType": "ServicePrincipal",
+        "roleDefinitionId": "[variables('keyVaultSecretsOfficerRoleId')]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "foundation": {
+      "type": "object",
+      "value": {
+        "resourceGroupName": "[resourceGroup().name]",
+        "location": "[parameters('location')]",
+        "acrName": "[take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50)]",
+        "acrLoginServer": "[reference(resourceId('Microsoft.ContainerRegistry/registries', take(format('{0}{1}', parameters('namePrefix'), variables('suffix')), 50)), '2023-07-01').loginServer]",
+        "containerAppsEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', format('cae-{0}', parameters('namePrefix')))]",
+        "keyVaultName": "[take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24)]",
+        "keyVaultUri": "[reference(resourceId('Microsoft.KeyVault/vaults', take(format('kv-{0}-{1}', parameters('namePrefix'), variables('suffix')), 24)), '2023-07-01').vaultUri]",
+        "agentIdentityId": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-agent', parameters('namePrefix')))]",
+        "agentIdentityClientId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-agent', parameters('namePrefix'))), '2023-01-31').clientId]",
+        "consoleIdentityId": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-console', parameters('namePrefix')))]",
+        "consoleIdentityClientId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('id-{0}-console', parameters('namePrefix'))), '2023-01-31').clientId]",
+        "logAnalyticsWorkspaceId": "[resourceId('Microsoft.OperationalInsights/workspaces', format('log-{0}', parameters('namePrefix')))]"
+      }
+    }
+  }
+}

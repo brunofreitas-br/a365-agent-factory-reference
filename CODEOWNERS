@@ -1,0 +1,9 @@
+# Replace @YOUR-GITHUB-TEAM with the consuming repository's GitHub team.
+# This file is intentionally generic for the public reference distribution.
+# Remove the leading `#` only after the team exists in your organization.
+
+# /template/ @YOUR-GITHUB-TEAM
+# /scripts/ @YOUR-GITHUB-TEAM
+# /infra/ @YOUR-GITHUB-TEAM
+# /.github/workflows/ @YOUR-GITHUB-TEAM
+# /CODEOWNERS @YOUR-GITHUB-TEAM
