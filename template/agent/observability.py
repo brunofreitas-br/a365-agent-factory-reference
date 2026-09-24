@@ -1,33 +1,11 @@
-"""Observabilidade A365 — exportação OTLP para o endpoint S2S do Agent 365.
+"""Observabilidade A365 com OTLP/JSON e autenticação S2S derivada do blueprint.
 
-Caminho de token (2 hops, VERIFICADO com span real no tenant):
+A cadeia usa duas trocas de token. O contrato S2S documentado exige a identidade
+runtime e o app role Agent365.Observability.OtelWrite no token final.
 
-    1. FIC       client_credentials + fmi_path=<instanceId>
-                 scope api://AzureAdTokenExchange/.default
-    2. Instance  client_credentials + client_assertion=<token do hop 1>
-                 scope api://9b975845-388f-4429-889e-eab1ef63949c/.default
-
-O token do hop 2 **não tem claim `roles`, `scp` nem `appid`** — a autorização vem do
-caminho FMI, não de um app role atribuído. Não é preciso criar appRoleAssignment para
-a instância: as permissões herdáveis que o `a365 setup all` configura no blueprint já
-bastam (Observability API com `Agent365.Observability.OtelWrite`).
-
-Use SEMPRE o endpoint `/observabilityService/`. O `/observability/` recusa este tipo de
-token com 401 `UnsupportedAccessTokenType` — é incompatibilidade de tipo de token, não
-falta de permissão.
-
-Resposta de sucesso (HTTP 200) mostra em quais sinks o span pousou:
-
-    {"results":[{"spanId":"...","sinks":{"flashpoint":{"status":"sent"},
-     "sentinel":{"status":"sent"},"esp":{"status":"sent"}}}],
-     "partialSuccess":{"rejectedSpans":0,"errorMessage":""}}
-
-O endpoint aceita OTLP/JSON além de protobuf — útil para diagnóstico sem dependências
-(ver scripts/smoke_observability.py).
-
-Nota de evolução: o destino é o SDK oficial (microsoft-agents-a365-observability-core),
-gerado pela skill `instrument-observability`. Os dois convergem no mesmo endpoint e no
-mesmo token — este módulo existe para o lab rodar hoje, sem esperar a fiação do SDK.
+HTTP 200 confirma processamento, não entrega. Avaliamos partialSuccess e results;
+roteamento confirmado ainda exige verificar a indexação no destino consumidor.
+O exportador não reenvia lotes, inclusive quando há entrega parcial.
 """
 from __future__ import annotations
 
@@ -110,14 +88,10 @@ class A365TokenService:
 
 
 class _A365JsonSpanExporter(SpanExporter):
-    """Exporta OTLP/JSON, não protobuf.
-
-    O exporter protobuf padrão do OTel devolve 403 neste endpoint; o mesmo span em JSON
-    devolve 200 com `rejectedSpans: 0`. Como o formato JSON está verificado ponta a ponta
-    (ver scripts/smoke_observability.py), é ele que usamos aqui.
-    """
+    """Exporta OTLP/JSON e verifica os recibos de roteamento por span e destino."""
 
     _KIND = {"INTERNAL": 1, "SERVER": 2, "CLIENT": 3, "PRODUCER": 4, "CONSUMER": 5}
+    _SAFE_REASONS = frozenset({"tenant_not_licensed"})
 
     def __init__(self, endpoint: str, token_service: A365TokenService, service_name: str):
         self._endpoint = endpoint
@@ -162,32 +136,98 @@ class _A365JsonSpanExporter(SpanExporter):
             response = httpx.post(
                 self._endpoint, json=payload, timeout=30.0,
                 headers={"Authorization": f"Bearer {self._token_service.get_token()}"})
-        except Exception:
-            log.exception("Falha ao exportar spans para o A365.")
+        except Exception as error:
+            log.error("A365 export: routing=unconfirmed exception=%s", type(error).__name__)
             return SpanExportResult.FAILURE
         if response.status_code != 200:
-            log.error("A365 recusou o lote de spans: HTTP %s %s",
-                      response.status_code, response.text[:300])
+            log.error("A365 export: http=%s routing=unconfirmed", response.status_code)
             return SpanExportResult.FAILURE
 
-        # HTTP 200 só diz que o serviço recebeu. Quantos ele aceitou está no corpo,
-        # e um 200 com spans rejeitados é o silêncio mais caro dessa integração.
         try:
-            parcial = (response.json() or {}).get("partialSuccess") or {}
+            body = response.json()
         except ValueError:
-            log.warning("A365 devolveu 200 com corpo não-JSON: %s", response.text[:200])
-            return SpanExportResult.SUCCESS
-
-        rejeitados = parcial.get("rejectedSpans", 0) or 0
-        mensagem = parcial.get("errorMessage") or ""
-        if rejeitados:
-            log.error("A365 aceitou %s de %s span(s). Rejeitados: %s. Motivo: %s",
-                      len(spans) - rejeitados, len(spans), rejeitados, mensagem or "(sem detalhe)")
+            log.error("A365 export: http=200 routing=unconfirmed response=invalid_json")
             return SpanExportResult.FAILURE
-        if mensagem:
-            log.warning("A365 aceitou todos os spans com aviso: %s", mensagem)
-        log.info("A365 aceitou %s span(s), 0 rejeitado(s).", len(spans))
-        return SpanExportResult.SUCCESS
+        return self._evaluate_response(body, spans)
+
+    def _evaluate_response(self, body, spans) -> SpanExportResult:
+        if not isinstance(body, dict):
+            log.error("A365 export: http=200 routing=unconfirmed response=invalid_body")
+            return SpanExportResult.FAILURE
+        partial = body.get("partialSuccess")
+        if partial is None:
+            partial = {}
+        if not isinstance(partial, dict):
+            log.error("A365 export: http=200 routing=unconfirmed response=invalid_partial")
+            return SpanExportResult.FAILURE
+        rejected_count = partial.get("rejectedSpans", 0)
+        if (isinstance(rejected_count, str) and len(rejected_count) <= 20
+                and rejected_count.isascii() and rejected_count.isdecimal()):
+            rejected_count = int(rejected_count)
+        if type(rejected_count) is not int or not 0 <= rejected_count <= len(spans):
+            log.error("A365 export: http=200 routing=unconfirmed response=invalid_count")
+            return SpanExportResult.FAILURE
+        results = body.get("results")
+        if not isinstance(results, list) or not results:
+            log.error("A365 export: http=200 routing=unconfirmed response=missing_results")
+            return SpanExportResult.FAILURE
+
+        expected_ids = {format(span.get_span_context().span_id, "016x") for span in spans}
+        received_ids = set()
+        totals = {"sent": 0, "rejected": 0, "not_routed": 0}
+        destinations = {}
+        routed_spans = 0
+        for result in results:
+            if not isinstance(result, dict):
+                log.error("A365 export: http=200 routing=unconfirmed response=invalid_result")
+                return SpanExportResult.FAILURE
+            span_id = result.get("spanId")
+            if (not isinstance(span_id, str) or span_id not in expected_ids
+                    or span_id in received_ids):
+                log.error("A365 export: http=200 routing=unconfirmed response=span_mismatch")
+                return SpanExportResult.FAILURE
+            received_ids.add(span_id)
+            sinks = result.get("sinks")
+            if not isinstance(sinks, dict) or not sinks:
+                log.error("A365 export: http=200 routing=unconfirmed response=missing_destinations")
+                return SpanExportResult.FAILURE
+            span_sent = False
+            for destination, receipt in sinks.items():
+                receipt_status = receipt.get("status") if isinstance(receipt, dict) else None
+                if not isinstance(receipt_status, str) or receipt_status not in totals:
+                    log.error("A365 export: http=200 routing=unconfirmed response=invalid_status")
+                    return SpanExportResult.FAILURE
+                counts = destinations.setdefault(
+                    destination, {"sent": 0, "rejected": 0, "not_routed": 0, "reasons": set()})
+                counts[receipt_status] += 1
+                totals[receipt_status] += 1
+                span_sent = span_sent or receipt_status == "sent"
+                reason = receipt.get("reason")
+                if reason:
+                    safe_reason = (reason if isinstance(reason, str) and reason in self._SAFE_REASONS
+                                   else "redacted")
+                    counts["reasons"].add(safe_reason)
+            routed_spans += int(span_sent)
+
+        for index, destination in enumerate(sorted(destinations), start=1):
+            counts = destinations[destination]
+            log.info("A365 destination_%s: sent=%s rejected=%s not_routed=%s reasons=%s",
+                     index, counts["sent"], counts["rejected"], counts["not_routed"],
+                     ",".join(sorted(counts["reasons"])) or "none")
+
+        failed = bool(rejected_count or totals["rejected"] or received_ids != expected_ids
+                      or routed_spans != len(spans))
+        routing = "partial" if routed_spans else "unconfirmed"
+        if not failed and not totals["not_routed"]:
+            routing = "confirmed"
+        message_present = bool(partial.get("errorMessage"))
+        level = logging.ERROR if failed else (
+            logging.WARNING if totals["not_routed"] or message_present else logging.INFO)
+        log.log(level, "A365 export: http=200 routing=%s spans=%s receipts=%s "
+                "rejected_spans=%s sent=%s rejected=%s not_routed=%s errorMessage_present=%s",
+                routing, len(spans), len(received_ids), rejected_count, totals["sent"],
+                totals["rejected"], totals["not_routed"], message_present)
+        return SpanExportResult.FAILURE if failed else SpanExportResult.SUCCESS
 
     def shutdown(self) -> None:
         pass
