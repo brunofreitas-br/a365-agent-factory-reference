@@ -54,6 +54,21 @@ param a365AgentInstanceId string
 @description('Client ID do blueprint do agente')
 param a365BlueprintClientId string
 
+type purviewConfiguration = {
+  enabled: bool
+  agentUserId: string
+  applicationId: string
+  checkOutput: bool
+}
+
+@description('Protecao Purview centrada no agente. Habilitar somente apos validar identidade, permissoes e politicas inline no tenant.')
+param purview purviewConfiguration = {
+  enabled: false
+  agentUserId: ''
+  applicationId: ''
+  checkOutput: false
+}
+
 @description('URI do segredo do blueprint no Key Vault (secretRef). Nunca passar o segredo em texto.')
 @secure()
 param blueprintSecretKeyVaultUri string
@@ -126,6 +141,10 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'A365_AGENT_INSTANCE_ID', value: a365AgentInstanceId }
             { name: 'A365_BLUEPRINT_CLIENT_ID', value: a365BlueprintClientId }
             { name: 'A365_BLUEPRINT_CLIENT_SECRET', secretRef: 'blueprint-client-secret' }
+            { name: 'PURVIEW_ENABLED', value: string(purview.enabled) }
+            { name: 'PURVIEW_AGENT_USER_ID', value: purview.agentUserId }
+            { name: 'PURVIEW_APPLICATION_ID', value: empty(purview.applicationId) ? a365AgentInstanceId : purview.applicationId }
+            { name: 'PURVIEW_CHECK_OUTPUT', value: string(purview.checkOutput) }
             { name: 'AZURE_CLIENT_ID', value: userAssignedIdentityClientId }
             { name: 'AZURE_OPENAI_ENDPOINT', value: azureOpenAiEndpoint }
             { name: 'AZURE_OPENAI_DEPLOYMENT', value: azureOpenAiDeployment }

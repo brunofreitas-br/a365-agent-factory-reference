@@ -38,11 +38,13 @@ class A365TokenService:
     """Cadeia FIC de 2 hops, com cache em memória e renovação preguiçosa."""
 
     def __init__(self, tenant_id: str, blueprint_client_id: str,
-                 blueprint_client_secret: str, instance_id: str):
+                 blueprint_client_secret: str, instance_id: str, *,
+                 resource_scope: str = OBSERVABILITY_SCOPE):
         self._tenant_id = tenant_id
         self._blueprint_client_id = blueprint_client_id
         self._blueprint_client_secret = blueprint_client_secret
         self._instance_id = instance_id
+        self._resource_scope = resource_scope
         self._token: str | None = None
         self._expires_at: float = 0.0
         self._lock = threading.Lock()
@@ -72,7 +74,7 @@ class A365TokenService:
             "client_assertion": fic["access_token"],
             "client_assertion_type":
                 "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-            "scope": OBSERVABILITY_SCOPE,
+            "scope": self._resource_scope,
         })
         expires_in = int(instance.get("expires_in", 3600))
         return instance["access_token"], time.time() + expires_in
@@ -83,7 +85,7 @@ class A365TokenService:
             if self._token and time.time() < self._expires_at - _REFRESH_MARGIN_SECONDS:
                 return self._token
             self._token, self._expires_at = self._fetch()
-            log.info("Token de observabilidade A365 renovado.")
+            log.info("Token de recurso do agente renovado.")
             return self._token
 
 

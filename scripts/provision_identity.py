@@ -403,6 +403,7 @@ def main() -> int:
         with open(out, "a", encoding="utf-8") as fh:
             fh.write(f"blueprint_app_id={blueprint_app_id}\n")
             fh.write(f"agent_identity_id={identity_id}\n")
+            fh.write(f"agent_user_id={agent_user_id or ''}\n")
     return 0
 
 

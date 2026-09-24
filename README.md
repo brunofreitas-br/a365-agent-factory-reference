@@ -112,6 +112,8 @@ auditáveis.
 | [`scripts/register_agent.py`](scripts/register_agent.py) | Registro administrativo no Microsoft 365 |
 | [`scripts/agentes_para_revisar.py`](scripts/agentes_para_revisar.py) | Seleção de agentes próximos da revisão |
 | [`template/agent/`](template/agent/) | Golden template FastAPI, LangGraph e OpenTelemetry |
+| [`template/agent/purview.py`](template/agent/purview.py) | Avaliação de conteúdo com contexto fixo do agente e aplicação das decisões DLP |
+| [`tests/`](tests/) | Regressões de observabilidade, políticas Purview e bloqueio no runtime |
 | [`template/infra/`](template/infra/) | Azure Container App de cada agente |
 | [`console/`](console/) | Console web autenticado para descoberta e invocação |
 | [`.github/workflows/`](.github/workflows/) | Intake, validação, provisionamento e revisão periódica |
@@ -123,7 +125,7 @@ auditáveis.
 | Workflow | Gatilho | Função |
 |---|---|---|
 | [`intake.yml`](.github/workflows/intake.yml) | `repository_dispatch` | Valida, cria branch, abre PR e realiza o merge |
-| [`validate-request.yml`](.github/workflows/validate-request.yml) | `pull_request` | Executa os Gates técnicos em alterações manuais |
+| [`validate-request.yml`](.github/workflows/validate-request.yml) | `pull_request` e `push` do runtime em `main` | Testa o runtime; em PRs também executa os Gates técnicos das solicitações |
 | [`provision-agent.yml`](.github/workflows/provision-agent.yml) | `workflow_run`, `push` ou manual | Provisiona identidade, runtime e registro |
 | [`revisao-agentes.yml`](.github/workflows/revisao-agentes.yml) | agenda semanal ou manual | Abre uma issue quando a revisão se aproxima |
 
@@ -319,6 +321,8 @@ Configure as variáveis:
 | `AGENT_FACTORY_PRINCIPAL_ID` | object ID do service principal do pipeline |
 | `AGENT_OWNER_OBJECT_IDS` | object IDs dos responsáveis, separados por vírgula |
 | `A365_AGENT_REGISTRATION_ENABLED` | `true` |
+| `PURVIEW_ENABLED` | Opcional, padrão `false`. Ativar somente após validar os pré-requisitos Purview do agente |
+| `PURVIEW_CHECK_OUTPUT` | Opcional, padrão `false`. Exige avaliação inline também para a resposta final |
 
 Exemplo:
 
@@ -328,6 +332,7 @@ gh variable set AZURE_CLIENT_ID -R <owner>/<repo> -b "$PIPELINE_APP_ID"
 
 Blueprint e Agent ID são valores **por agente**. O workflow recebe ambos diretamente do
 provisionamento e não utiliza variáveis fixas para esses identificadores.
+O Agent User também vem do output `agent_user_id`; não substituí-lo pelo invocador ou pelo sponsor.
 
 ### 7. Criar o Forms e o flow do Power Automate
 
@@ -485,6 +490,104 @@ GitHub Actions.
 
 ---
 
+## Proteção Purview opcional
+
+A integração é **centrada no agente**, não no usuário que o invocou. O runtime consulta as
+políticas usando um Agent User fixo e uma aplicação protegida configurada no deploy.
+A autenticação e a autorização do chamador continuam independentes desse controle.
+
+**Estado:** implementação coberta por testes locais e por validação inline em tenant de teste,
+com Agent User fixo: conteúdo permitido, prompt sensível bloqueado e retorno sintético de
+ferramenta bloqueado. Isso não certifica outras políticas, agentes ou tenants. A evidência no
+portal continua uma verificação separada. O recurso permanece desligado por padrão na Factory;
+a ativação deve ser explícita em cada implantação preparada.
+
+### Pontos de controle
+
+| Conteúdo | Momento | Atividade enviada |
+|---|---|---|
+| Prompt recebido | Antes de chamar o grafo, modelo ou ferramentas | `uploadText` |
+| Retorno textual da ferramenta | Antes de publicar o resultado no estado do grafo ou retorná-lo ao chamador | `uploadText`, como entrada do agente, sujeito à validação no tenant |
+| Resposta final, opcional | Antes de entregar qualquer campo da resposta HTTP | `downloadText` |
+
+O nó `act` do exemplo ainda simula uma operação. Ao adicionar ferramentas reais, manter a
+avaliação do conteúdo antes de publicá-lo no grafo, enviá-lo a outro modelo ou entregá-lo ao
+usuário. Esse controle não desfaz efeitos de uma ferramenta já executada nem substitui ACLs.
+
+### Pré-requisitos e configuração
+
+1. Confirmar o Agent User pertencente à identidade runtime do agente. O App ID, o service
+   principal e o sponsor não são substitutos para o `userId` exigido pela API.
+2. Validar licenciamento e habilitar pay-as-you-go do Purview com aprovação administrativa.
+3. Conceder as permissões de aplicação Graph `ProtectionScopes.Compute.User` e
+   `Content.Process.User` à identidade chamadora, diretamente ou por herança configurada
+   no blueprint. O pipeline não concede essas permissões automaticamente.
+4. Configurar e validar uma política DLP que cubra a aplicação e o Agent User. A configuração de DLP
+   para aplicações Entra usa PowerShell. Uma política de coleta offline, sozinha, não atende
+   ao requisito de bloqueio inline desta implementação. Coleta e retenção de conteúdo devem
+   ser uma decisão explícita do administrador.
+5. Habilitar `PURVIEW_ENABLED=true` somente no escopo de implantação preparado. O workflow
+   lê essa variável do repositório ou GitHub Environment: ela afeta os próximos provisionamentos
+   e redeploys que utilizarem esse escopo, não altera agentes já implantados por si só.
+
+Configuração própria não significa regras diferentes ou uma política obrigatoriamente exclusiva
+para cada agente. A Factory exige uma política aplicável ao contexto configurado; regras
+corporativas podem ser reutilizadas, com o escopo de aplicações e identidades validado pelo
+administrador. Políticas de outros workloads não passam a proteger o agente automaticamente.
+
+A golden baseline distribui código de avaliação, não a política do tenant, grants, licenças ou
+IDs do ambiente de origem. Por agente, o pipeline passa seu Agent User e sua aplicação protegida;
+o administrador prepara os grants e a política antes da ativação. No workflow atual, as flags
+Purview não são campos individuais do formulário ou da solicitação. Para ativação isolada,
+usar configuração explícita no deploy daquele agente, sem habilitar o repositório inteiro.
+Com a integração habilitada, ausência de escopo inline aplicável interrompe a invocação com
+HTTP 503; não há liberação silenciosa nem uso da identidade de outro agente.
+
+O Bicep recebe o objeto `purview` com `enabled`, `agentUserId`, `applicationId` e `checkOutput`.
+O workflow preenche o Agent User a partir do provisionamento e deixa `applicationId` vazio
+para usar o Entra Agent ID como aplicação protegida. Um deploy direto pode configurar outra
+aplicação explicitamente, desde que corresponda ao alvo da política validada.
+
+No container, as variáveis são `PURVIEW_ENABLED`, `PURVIEW_AGENT_USER_ID`,
+`PURVIEW_APPLICATION_ID` e `PURVIEW_CHECK_OUTPUT`. O token Graph usa a cadeia S2S existente
+com o recurso `https://graph.microsoft.com/.default`, em uma instância e cache separados
+do token de observabilidade. Não há fallback para a identidade humana ou outra aplicação.
+
+### Decisões e limites
+
+- `protectionScopes/compute` é armazenado em cache por até cinco minutos, isolado por cliente
+  de agente. Seu `ETag` vai em `If-None-Match`. `protectionScopeState=modified` invalida o cache;
+  uma decisão de conteúdo sem bloqueio exige nova consulta e validação dos escopos antes de
+  prosseguir, sem reenviar o conteúdo já avaliado. Erro no refresh, perda de escopo inline ou
+  restrição nova interrompem a operação. Um bloqueio nunca é repetido como tentativa de liberação.
+- `restrictAccess/block` devolve HTTP 403 com `PURVIEW_DLP_BLOCKED`. `warn` também interrompe
+  a operação com `PURVIEW_CONFIRMATION_REQUIRED`; não existe override nesta versão.
+- Uma ação `audit` pode prosseguir quando a avaliação inline foi concluída. Os logs registram
+  `audited`, sem conteúdo da conversa.
+- Falta de escopo inline, HTTP 202/204 sem decisão, erro de processamento, timeout ou resposta
+  desconhecida devolvem HTTP 503 com `PURVIEW_EVALUATION_UNAVAILABLE`, sem liberar conteúdo.
+- O limite preventivo **desta implementação** é 64 KiB de texto UTF-8 por avaliação. Conteúdo
+  maior é interrompido, não truncado. Isso não descreve um limite do serviço Purview.
+- Não há envio de prompts/resultados aos logs do aplicativo. A inspeção envia o conteúdo ao
+  Purview; eventual armazenamento depende das políticas de coleta do tenant.
+- `PURVIEW_CHECK_OUTPUT=true` exige escopo inline para `downloadText`. A documentação do
+  cenário garante DLP para prompts por tipos de informação sensível; não assumir suporte a
+  bloqueio de saída apenas porque a API aceita essa atividade.
+- `/healthz` mede a disponibilidade do processo, não a aplicação da política Purview.
+
+### Testes
+
+Em um ambiente Python 3.12 isolado:
+
+```bash
+python -m pip install -r template/agent/requirements.txt
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+Os testes não usam credenciais, modelo real ou chamadas externas. Antes de produção, validar
+conteúdo permitido, bloqueio de prompt com zero chamadas ao modelo, bloqueio do retorno da
+ferramenta, mudança de política e indisponibilidade da avaliação, além da evidência no Purview.
+
 ## Validação operacional
 
 Após o primeiro deploy, valide três planos independentes:
@@ -514,11 +617,14 @@ Depois de invocar o agente pelo console, o log deve confirmar:
 
 ```text
 Observabilidade A365 ativa para o agente <agent-id>
-Token de observabilidade A365 renovado.
-A365 aceitou <N> span(s), 0 rejeitado(s).
+Token de recurso do agente renovado.
+A365 export: http=200 routing=confirmed ...
 ```
 
 O `<agent-id>` deve corresponder ao Entra Agent ID criado para aquele agente.
+O exportador confere `partialSuccess` e `results`. Mesmo com roteamento confirmado, conferir
+os eventos `InvokeAgent`, `InferenceCall` e `ExecuteToolBySDK` no `CloudAppEvents` para validar
+a indexação no Defender. HTTP 200, isoladamente, não comprova essa entrega.
 
 ---
 
@@ -542,6 +648,9 @@ monitoramento, rotação de credenciais e requisitos regulatórios da organizaç
 - [Microsoft Agent 365 samples](https://github.com/microsoft/Agent365-Samples)
 - [Workload identity federation for GitHub Actions](https://learn.microsoft.com/entra/workload-id/workload-identity-federation)
 - [Azure Container Apps authentication](https://learn.microsoft.com/azure/container-apps/authentication)
+- [Integração das APIs Purview](https://learn.microsoft.com/purview/developer/use-the-api)
+- [Purview para aplicações Entra](https://learn.microsoft.com/purview/ai-entra-registered)
+- [Contrato processContent](https://learn.microsoft.com/graph/api/userdatasecurityandgovernance-processcontent?view=graph-rest-1.0)
 
 ## Licença
 

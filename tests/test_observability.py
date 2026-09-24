@@ -164,5 +164,26 @@ class ExportResponseTests(unittest.TestCase):
         post.assert_not_called()
 
 
+class AgentTokenResourceTests(unittest.TestCase):
+    def test_default_resource_and_graph_resource_have_separate_caches(self):
+        common = ("synthetic-tenant", "synthetic-blueprint", "synthetic-secret", "synthetic-agent")
+        telemetry = observability.A365TokenService(*common)
+        graph = observability.A365TokenService(*common, resource_scope="https://graph.microsoft.com/.default")
+        for service, expected_scope, token in (
+                (telemetry, observability.OBSERVABILITY_SCOPE, "synthetic-telemetry-token"),
+                (graph, "https://graph.microsoft.com/.default", "synthetic-graph-token")):
+            with self.subTest(scope=expected_scope):
+                with patch.object(service, "_post", side_effect=[
+                        {"access_token": "synthetic-exchange-token"},
+                        {"access_token": token, "expires_in": 3600},
+                ]) as post:
+                    self.assertEqual(service.get_token(), token)
+                    self.assertEqual(service.get_token(), token)
+                    self.assertEqual(post.call_count, 2)
+                    self.assertEqual(post.call_args_list[0].args[0]["scope"], observability.TOKEN_EXCHANGE_SCOPE)
+                    self.assertEqual(post.call_args_list[1].args[0]["scope"], expected_scope)
+        self.assertNotEqual(telemetry._token, graph._token)
+
+
 if __name__ == "__main__":
     unittest.main()

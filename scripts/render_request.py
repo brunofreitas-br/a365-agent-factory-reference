@@ -151,7 +151,8 @@ def main() -> int:
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
 
-    shutil.copytree(TEMPLATE / "agent", out_dir / "agent")
+    shutil.copytree(TEMPLATE / "agent", out_dir / "agent",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copy2(TEMPLATE / "Dockerfile", out_dir / "Dockerfile")
     shutil.copytree(TEMPLATE / "infra", out_dir / "infra")
 

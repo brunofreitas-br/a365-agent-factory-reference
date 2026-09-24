@@ -13,10 +13,13 @@ import json
 import os
 import pathlib
 import re
+from functools import partial
 from typing import Annotated, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from opentelemetry import trace
+
+from purview import PurviewPolicyClient
 
 tracer = trace.get_tracer(__name__)
 
@@ -27,6 +30,7 @@ MANIFEST = json.loads(
 
 class AgentState(TypedDict):
     input: str
+    correlation_id: str
     category: str
     urgency: Literal["baixa", "media", "alta"]
     output: str
@@ -54,7 +58,7 @@ def _chat_model():
     )
 
 
-def classify(state: AgentState) -> dict:
+def classify(state: AgentState, *, purview_client: PurviewPolicyClient | None = None) -> dict:
     with tracer.start_as_current_span("classify") as span:
         span.set_attribute("gen_ai.operation.name", "chat")
         span.set_attribute("gen_ai.system", "az.ai.openai")
@@ -84,12 +88,13 @@ def classify(state: AgentState) -> dict:
         if urgency not in ("baixa", "media", "alta"):
             urgency = "baixa"
 
-        span.set_attribute("a365.category", category)
+        if purview_client is None:
+            span.set_attribute("a365.category", category)
         span.set_attribute("a365.urgency", urgency)
         return {"category": category, "urgency": urgency, "steps": ["classify"]}
 
 
-def act(state: AgentState) -> dict:
+def act(state: AgentState, *, purview_client: PurviewPolicyClient | None = None) -> dict:
     """Onde o efeito colateral aconteceria. Só grava se o manifesto permitir escrita."""
     with tracer.start_as_current_span("act") as span:
         span.set_attribute("gen_ai.operation.name", "execute_tool")
@@ -105,13 +110,19 @@ def act(state: AgentState) -> dict:
             output = (f"Classificado como {state['category']} "
                       f"(urgência {state['urgency']}) e registrado.")
 
-        return {"output": output, "steps": ["act"]}
+        result = {"output": output, "steps": ["act"]}
+        if purview_client is not None:
+            purview_client.check_text(
+                json.dumps(result, ensure_ascii=False), activity="uploadText",
+                checkpoint="tool_response", correlation_id=state.get("correlation_id", ""),
+                sequence_number=1)
+        return result
 
 
-def build_graph():
+def build_graph(purview_client: PurviewPolicyClient | None = None):
     graph = StateGraph(AgentState)
-    graph.add_node("classify", classify)
-    graph.add_node("act", act)
+    graph.add_node("classify", partial(classify, purview_client=purview_client))
+    graph.add_node("act", partial(act, purview_client=purview_client))
     graph.add_edge(START, "classify")
     graph.add_edge("classify", "act")
     graph.add_edge("act", END)

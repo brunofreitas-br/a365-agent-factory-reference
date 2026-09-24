@@ -132,6 +132,10 @@ jobs:
         id: deploy
         if: steps.req.outputs.slug != ''
         working-directory: build/${{ steps.req.outputs.slug }}
+        env:
+          PURVIEW_ENABLED: ${{ vars.PURVIEW_ENABLED || 'false' }}
+          PURVIEW_CHECK_OUTPUT: ${{ vars.PURVIEW_CHECK_OUTPUT || 'false' }}
+          PURVIEW_AGENT_USER_ID: ${{ steps.identidade.outputs.agent_user_id }}
         run: |
           set -euo pipefail
           # Container App exige a URI do SEGREDO, não a do cofre:
@@ -148,6 +152,20 @@ jobs:
             exit 1
           fi
 
+          purview_config=$(python - <<'PY'
+          import json, os
+          for name in ("PURVIEW_ENABLED", "PURVIEW_CHECK_OUTPUT"):
+              if os.environ[name] not in ("true", "false"):
+                  raise SystemExit(f"::error::{name} deve ser true ou false.")
+          enabled = os.environ["PURVIEW_ENABLED"] == "true"
+          agent_user_id = os.environ["PURVIEW_AGENT_USER_ID"]
+          if enabled and not agent_user_id:
+              raise SystemExit("::error::Purview requer o Agent User do agente provisionado.")
+          print(json.dumps({"enabled": enabled, "agentUserId": agent_user_id,
+                            "applicationId": "", "checkOutput": os.environ["PURVIEW_CHECK_OUTPUT"] == "true"}))
+          PY
+          )
+
           az deployment group create \
             --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
             --template-file infra/containerapp.bicep \
@@ -161,6 +179,7 @@ jobs:
               a365TenantId="${{ vars.AZURE_TENANT_ID }}" \
               a365AgentInstanceId="$aid" \
               a365BlueprintClientId="$bp" \
+              purview="$purview_config" \
               blueprintSecretKeyVaultUri="$secret_uri" \
               azureOpenAiEndpoint="${{ vars.AZURE_OPENAI_ENDPOINT }}" \
               azureOpenAiDeployment="${{ vars.AZURE_OPENAI_DEPLOYMENT }}"

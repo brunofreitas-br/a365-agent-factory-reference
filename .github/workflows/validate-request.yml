@@ -7,13 +7,42 @@ on:
       - 'requests/**.yaml'
       - 'scripts/**.py'
       - 'template/**'
+      - 'tests/**'
+      - '.github/workflows/validate-request.yml'
+      - '.github/workflows/provision-agent.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'template/agent/**'
+      - 'tests/**'
+      - '.github/workflows/validate-request.yml'
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
+  runtime-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      PURVIEW_ENABLED: 'false'
+      LANGSMITH_TRACING: 'false'
+      LANGCHAIN_TRACING_V2: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Instalar dependencias do runtime
+        run: python -m pip install --disable-pip-version-check -r template/agent/requirements.txt
+      - name: Testar observabilidade e controles Purview sem rede externa
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
   validar:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
