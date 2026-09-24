@@ -76,6 +76,27 @@ jobs:
         if: steps.req.outputs.slug != ''
         run: python scripts/validate_request.py "${{ steps.req.outputs.file }}"
 
+      - name: Validar acesso independente da API
+        id: api
+        if: steps.req.outputs.slug != ''
+        env:
+          API_ALLOWED_CLIENT_IDS: ${{ vars.API_ALLOWED_CLIENT_IDS || '[]' }}
+          API_EXTERNAL_INGRESS: ${{ vars.API_EXTERNAL_INGRESS || 'false' }}
+        run: |
+          python - <<'PY'
+          import json, os, uuid
+          clients = json.loads(os.environ["API_ALLOWED_CLIENT_IDS"])
+          if not isinstance(clients, list) or not clients:
+              raise SystemExit("::error::API_ALLOWED_CLIENT_IDS requer uma lista JSON nao vazia.")
+          clients = sorted({str(uuid.UUID(client)) for client in clients})
+          external = os.environ["API_EXTERNAL_INGRESS"]
+          if external not in ("true", "false"):
+              raise SystemExit("::error::API_EXTERNAL_INGRESS deve ser true ou false.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("allowed_clients=" + json.dumps(clients) + "\n")
+              output.write("external_ingress=" + external + "\n")
+          PY
+
       - name: Renderizar artefatos
         if: steps.req.outputs.slug != ''
         run: python scripts/render_request.py "${{ steps.req.outputs.file }}" --out build/
@@ -101,6 +122,7 @@ jobs:
           python scripts/provision_identity.py \
             "build/${{ steps.req.outputs.slug }}/agent/agent_manifest.json" \
             --tenant-domain "${{ vars.A365_TENANT_DOMAIN }}" \
+            --api-contract-out "build/${{ steps.req.outputs.slug }}/agent_api.json" \
             --secret-out "build/${{ steps.req.outputs.slug }}/blueprint-secret.json"
 
       - name: Guardar o segredo do blueprint no Key Vault
@@ -133,6 +155,9 @@ jobs:
         if: steps.req.outputs.slug != ''
         working-directory: build/${{ steps.req.outputs.slug }}
         env:
+          API_ALLOWED_CLIENT_IDS: ${{ steps.api.outputs.allowed_clients }}
+          API_EXTERNAL_INGRESS: ${{ steps.api.outputs.external_ingress }}
+          API_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
           PURVIEW_ENABLED: ${{ vars.PURVIEW_ENABLED || 'false' }}
           PURVIEW_CHECK_OUTPUT: ${{ vars.PURVIEW_CHECK_OUTPUT || 'false' }}
           PURVIEW_AGENT_USER_ID: ${{ steps.identidade.outputs.agent_user_id }}
@@ -179,6 +204,8 @@ jobs:
               a365TenantId="${{ vars.AZURE_TENANT_ID }}" \
               a365AgentInstanceId="$aid" \
               a365BlueprintClientId="$bp" \
+              apiAllowedClientIds="$API_ALLOWED_CLIENT_IDS" \
+              externalIngress="$API_EXTERNAL_INGRESS" \
               purview="$purview_config" \
               blueprintSecretKeyVaultUri="$secret_uri" \
               azureOpenAiEndpoint="${{ vars.AZURE_OPENAI_ENDPOINT }}" \
@@ -196,6 +223,16 @@ jobs:
           fi
           echo "fqdn=$fqdn" >> "$GITHUB_OUTPUT"
           echo "Container App em https://$fqdn"
+          python - "$fqdn" <<'PY'
+          import json, os, pathlib, sys
+          path = pathlib.Path("agent_api.json")
+          contract = json.loads(path.read_text())
+          contract.update(endpoint="https://" + sys.argv[1] + "/invoke",
+                          tenantId=os.environ["API_TENANT_ID"],
+                          allowedClientIds=json.loads(os.environ["API_ALLOWED_CLIENT_IDS"]),
+                          externalIngress=os.environ["API_EXTERNAL_INGRESS"] == "true")
+          path.write_text(json.dumps(contract, indent=2), encoding="utf-8")
+          PY
 
       # Registro no inventário administrativo do M365 (Agent Registration API, /beta).
       # É o que torna o agente visível e governável. NÃO há publicação em catálogo aqui:
@@ -223,6 +260,7 @@ jobs:
           name: artefatos-${{ steps.req.outputs.slug }}
           path: |
             build/${{ steps.req.outputs.slug }}/a365.config.json
+            build/${{ steps.req.outputs.slug }}/agent_api.json
             build/${{ steps.req.outputs.slug }}/agent/agent_manifest.json
             build/${{ steps.req.outputs.slug }}/agent/agent_registration.json
           if-no-files-found: warn

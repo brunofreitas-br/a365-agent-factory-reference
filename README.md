@@ -12,8 +12,14 @@ um fluxo repetível de onboarding de agentes customizados — da solicitação �
 > O botão provisiona a **fundação Azure compartilhada** a partir do template ARM versionado
 > neste repositório. Em um fork, atualize a URL do botão para apontar para o template do fork.
 
-> **Status da referência:** fluxo validado ponta a ponta em ambiente de laboratório. O
-> Microsoft Agent 365 e algumas APIs utilizadas estão em preview.
+> **Status da referência:** fluxo da Factory validado em laboratório. API autenticada e OBO
+> validados com Entra/Graph reais por cliente independente em loopback, com modelo sintético.
+> A imagem desta versão passou em 105 testes no Python 3.12.14. O rollout da API nova no Azure
+> ainda é uma etapa separada. O Microsoft Agent 365 e algumas APIs utilizadas estão em preview.
+
+> **Mudança de contrato:** a API agora exige bearer token e `API_ALLOWED_CLIENT_IDS` explícito.
+> O console legado ainda não envia esse token. Antes de criar ou atualizar agentes, preparar
+> os clientes e consentimentos descritos em [API autenticada e OBO](#api-autenticada-e-obo).
 
 ---
 
@@ -31,7 +37,9 @@ A solução estabelece um processo consistente para que cada agente tenha, desde
 | **Segredos protegidos** | Azure Key Vault, acessado por managed identity |
 | **Registro administrativo** | Agent Registration API no inventário do Microsoft 365 |
 | **Observabilidade** | OpenTelemetry enviado ao Agent 365 pelo endpoint S2S |
-| **Acesso controlado** | Console web protegido por autenticação do Microsoft Entra |
+| **Acesso controlado** | API com validação Entra, clientes autorizados e permissões por tipo de chamador |
+| **Delegação humana** | OBO opcional para Graph `/me`, sem fallback para credencial de aplicação |
+| **Proteção de conteúdo** | Purview opcional, com política e Agent User próprios do contexto do agente |
 | **Revisão periódica** | GitHub issue criada quando a data de revisão se aproxima |
 
 O agente de exemplo classifica textos por categoria e urgência. A lógica é deliberadamente
@@ -57,7 +65,8 @@ flowchart TD
     K --> L[Key Vault + ACR + Container App]
     L --> M[Agent Registration no Microsoft 365]
     M --> N[OpenTelemetry para Agent 365]
-    O[Console web<br/>Microsoft Entra ID] --> N1[Agentes com ingress interno]
+    C1[Cliente independente<br/>Access token Entra] --> N1[API autenticada do agente<br/>Rede configurada no deploy]
+    O[Console opcional<br/>Adaptacao de token pendente] -.-> N1
     N1 --> N
     P[Workflow semanal] --> Q{Gate 4<br/>Revisão periódica}
 ```
@@ -65,7 +74,8 @@ flowchart TD
 ### Princípios do desenho
 
 - **Uma identidade A365 por agente:** blueprint e Agent ID nunca são compartilhados entre agentes.
-- **Agentes sem exposição direta:** o runtime usa ingress interno; o console é a única porta web externa.
+- **Consumo independente:** a API não depende do console; o runtime exige autenticação também em rede privada.
+- **Rede explícita:** ingress interno por padrão; o alcance fora do ambiente ACA depende da configuração aprovada de rede.
 - **Sem segredo de pipeline:** GitHub Actions autentica no Azure por OIDC federado.
 - **Configuração versionada:** cada solicitação aprovada vira um arquivo YAML revisável.
 - **Separação de responsabilidades:** o dono de negócio aprova no Power Automate; a plataforma aplica políticas no pipeline.
@@ -92,7 +102,8 @@ auditáveis.
 - alerta para ciclos de revisão superiores a 18 meses;
 - alerta quando os responsáveis técnico e de negócio são a mesma pessoa;
 - revisão adicional para dados restritos em produção;
-- bloqueio de WorkIQ em autenticação S2S;
+- bloqueio de WorkIQ, cuja integração ainda não está implementada neste runtime;
+- bloqueio de OBO humano em execução autônoma;
 - bloqueio de perfis de runtime não suportados por este template;
 - cálculo de risco a partir de sensibilidade, escrita, autonomia e ambiente.
 
@@ -111,9 +122,12 @@ auditáveis.
 | [`scripts/provision_identity.py`](scripts/provision_identity.py) | Blueprint, principal, Entra Agent ID e Agent User |
 | [`scripts/register_agent.py`](scripts/register_agent.py) | Registro administrativo no Microsoft 365 |
 | [`scripts/agentes_para_revisar.py`](scripts/agentes_para_revisar.py) | Seleção de agentes próximos da revisão |
+| [`scripts/invoke_agent.py`](scripts/invoke_agent.py) | Cliente Entra de linha de comando, independente do console |
 | [`template/agent/`](template/agent/) | Golden template FastAPI, LangGraph e OpenTelemetry |
+| [`template/agent/authentication.py`](template/agent/authentication.py) | Validação e autorização dos tokens de entrada da API |
+| [`template/agent/delegation.py`](template/agent/delegation.py) | Troca FMI/OBO com MSAL e leitura delegada fixa do Graph |
 | [`template/agent/purview.py`](template/agent/purview.py) | Avaliação de conteúdo com contexto fixo do agente e aplicação das decisões DLP |
-| [`tests/`](tests/) | Regressões de observabilidade, políticas Purview e bloqueio no runtime |
+| [`tests/`](tests/) | Regressões de autenticação, OBO, cliente independente, observabilidade e Purview |
 | [`template/infra/`](template/infra/) | Azure Container App de cada agente |
 | [`console/`](console/) | Console web autenticado para descoberta e invocação |
 | [`.github/workflows/`](.github/workflows/) | Intake, validação, provisionamento e revisão periódica |
@@ -321,6 +335,8 @@ Configure as variáveis:
 | `AGENT_FACTORY_PRINCIPAL_ID` | object ID do service principal do pipeline |
 | `AGENT_OWNER_OBJECT_IDS` | object IDs dos responsáveis, separados por vírgula |
 | `A365_AGENT_REGISTRATION_ENABLED` | `true` |
+| `API_ALLOWED_CLIENT_IDS` | Obrigatória: lista JSON não vazia dos client IDs autorizados a chamar a API; consentimento/role também são necessários |
+| `API_EXTERNAL_INGRESS` | Opcional, padrão `false`. Publica o app fora do mesmo ambiente ACA; a rede do ambiente determina se o acesso é público ou privado |
 | `PURVIEW_ENABLED` | Opcional, padrão `false`. Ativar somente após validar os pré-requisitos Purview do agente |
 | `PURVIEW_CHECK_OUTPUT` | Opcional, padrão `false`. Exige avaliação inline também para a resposta final |
 
@@ -351,6 +367,8 @@ validação, o PR e o merge permanecem no GitHub Actions.
 4. Confirme o PR e o novo arquivo em [`requests/`](requests/).
 5. Acompanhe o workflow **Provisionar agente**.
 6. Confirme o Container App e o registro no Microsoft 365.
+7. Consulte o artefato `agent_api.json`, conclua os consentimentos/atribuições aprovados e
+  teste a invocação com o cliente independente descrito abaixo. O registro não comprova acesso.
 
 O provisionamento também pode ser iniciado manualmente:
 
@@ -366,13 +384,154 @@ Para um teste sem Forms, copie
 
 ---
 
+## API autenticada e OBO
+
+**Estado desta versão:** golden template com autenticação obrigatória, OBO e consumidor
+independente. Configuração do blueprint, token S2S, consentimento restrito ao usuário de teste,
+herança e OBO até Graph `/me` foram validados com Entra/Graph reais e API em loopback. O modelo
+foi sintético nessa prova; Conditional Access/claims challenge e indisponibilidade foram
+exercitados em testes simulados. A imagem passou em **105 testes no Python 3.12.14**, incluindo
+as regressões Purview e S2S, sem inconsistências de dependências. O rollout da API nova no Azure
+ainda exige aceite na rede e com os consumidores escolhidos. Outros IdPs, WorkIQ e `user_fic`
+não estão implementados.
+
+A distribuição reutilizável é o template fonte. O pipeline renderiza o manifesto aprovado e
+constrói uma imagem por agente no registry do tenant de destino. O artefato neutro utilizado
+na validação da golden não distribui identidades, credenciais ou políticas do lab.
+
+### Contrato de entrada
+
+- `/invoke` e `/manifest` exigem `Authorization: Bearer <access-token>`; `/healthz` é público
+  e não executa modelo, ferramentas ou consultas de política. Documentação HTTP interativa
+  e a rota OpenAPI ficam desabilitadas nesta versão.
+- Tokens Entra **v2**, single-tenant, RS256, audiência igual ao **client ID do blueprint**.
+  O emissor e o endereço JWKS são derivados da configuração do servidor, nunca do token.
+- Usuários: `scp` deve conter `Agent.Invoke`. Aplicações: `idtyp=app` e `roles` deve conter
+  `Agent.Invoke.Application`. Nos dois casos, `azp` precisa estar em `API_ALLOWED_CLIENT_IDS`.
+- Falta de token ou token inválido resulta em 401; chamador sem autorização, 403; falha ao
+  obter chaves de assinatura, 503. Não há modo anônimo nem confiança implícita em headers
+  `X-MS-*` do console ou do serviço de hospedagem.
+- O scope/role autoriza invocar a API. Ele não concede acesso ao Graph, a outras ferramentas
+  ou aos dados de outro usuário. A lista de clientes não substitui consentimento ou atribuição.
+
+O provisionador define `Agent.Invoke` como escopo delegado de consentimento administrativo
+e `Agent.Invoke.Application` como papel de aplicação, configura tokens v2 e a claim opcional
+`idtyp` no blueprint, preservando definições existentes. Os valores são distintos porque o
+Entra rejeitou scope e app role homônimos na prova real. Não concede permissões aos clientes
+automaticamente. Alterar um blueprint existente para v2 exige revisar seus consumidores antes
+do redeploy.
+
+O workflow produz o artefato `agent_api.json` com audiência, escopos, endpoint, tenant e clientes
+permitidos, sem tokens ou segredos. As variáveis de clientes e ingress têm escopo de repositório
+ou GitHub Environment, não de solicitação. Um deploy específico pode fornecer valores próprios.
+
+### Operação delegada
+
+`auth_mode: s2s` mantém o classificador e sua ferramenta simulada. O acesso ao Azure OpenAI,
+Purview e observabilidade continua usando suas credenciais de serviço já existentes.
+
+`auth_mode: obo` exige um chamador usuário. A ferramenta inicial é exclusivamente a leitura
+`GET https://graph.microsoft.com/v1.0/me?$select=id,displayName`, com `User.Read`. Ela não
+acessa e-mail ou arquivos nem executa escrita, mesmo que esses usos sejam citados no prompt.
+
+```text
+Cliente -> access token aud=blueprint, scp=Agent.Invoke -> API
+Blueprint -> credencial FMI vinculada à instância -> T1
+Instância -> T1 + token humano -> token delegado Graph/User.Read
+Ferramenta -> Graph /me -> Purview do agente, quando habilitado -> resposta
+```
+
+Preparação administrativa no tenant:
+
+1. Autorizar o aplicativo cliente a consumir o scope `api://<blueprint-client-id>/Agent.Invoke`.
+  Para aplicação S2S, atribuir o app role `Agent.Invoke.Application` no principal do blueprint e usar
+  `api://<blueprint-client-id>/.default`. Manter também a allowlist do runtime.
+2. Para OBO, declarar e conceder consentimento delegado aprovado de `User.Read` do Graph
+  no blueprint. A prova usou `consentType=Principal`, restrito a um usuário, tanto para o cliente
+  consumir a API quanto para o blueprint acessar Graph. Consentimento tenant-wide exige
+  aprovação separada. Configurar a herança para Graph: `inheritableScopes.kind=allAllowed` e
+  `inheritableRoles.kind=none`. Revisar os demais scopes já concedidos: `allAllowed` não se
+  limita a `User.Read`. O pipeline não configura essa herança ou consentimento automaticamente.
+3. Confirmar cliente, blueprint e instância no mesmo tenant. O token humano deve ter audiência
+  do blueprint, não do Graph, da instância ou do app do console.
+4. Validar com um cliente independente na rede escolhida antes de disponibilizar o endpoint.
+
+O MSAL 1.39 usa `fmi_path` nativo e cache FMI separado por instância. Cada troca delegada usa
+cache apenas da chamada, sem persistência ou reutilização entre usuários. Tokens não entram
+no estado do grafo, payload do modelo, resposta ou logs da aplicação. Falha OBO nunca aciona
+S2S. Consentimento ausente retorna 403; necessidade de nova autenticação retorna 401, com
+`WWW-Authenticate` e claims challenge quando fornecido pelo serviço. O cliente trata o desafio,
+mas consentimento de agentes filhos deve ser preparado administrativamente no blueprint.
+
+O contexto Purview permanece no **Agent User do agente**, nunca no humano autenticado. O
+prompt é verificado antes do grafo, e o perfil retornado pelo Graph passa pelo hook de ferramenta
+antes de ser entregue. A inspeção adicional da resposta final continua opcional e separada.
+
+O provedor OBO aceita a credencial de blueprint existente do lab (`A365_BLUEPRINT_AUTH_MODE=secret`)
+ou `managed_identity`, com `AZURE_CLIENT_ID` e uma FIC previamente configurada no blueprint.
+Managed identity é a opção recomendada para produção. A opção OBO não migra automaticamente
+as credenciais atuais de observabilidade/Purview nem o provisionamento de segredos da Factory.
+
+### Consumidor independente
+
+Instalar as dependências do runtime e, para os testes de Factory, `pyyaml jsonschema` em um
+ambiente isolado. Para login de usuário, registrar um cliente público de teste com redirect
+URI de desktop `http://localhost` e o consentimento indicado acima. Nunca usar o blueprint
+como aplicativo de login interativo.
+
+```bash
+python scripts/invoke_agent.py \
+  --endpoint 'https://<endpoint-do-agente>/invoke' \
+  --tenant-id '<tenant-id>' \
+  --blueprint-id '<blueprint-client-id>' \
+  --client-id '<client-id-do-consumidor>' \
+  --mode user --input 'Classifique este alerta sintetico de CPU.'
+```
+
+Para S2S, usar `--mode application` com `AGENT_CLIENT_SECRET` fornecido por um mecanismo
+seguro do ambiente, nunca no argumento da linha de comando. Esse modo é um exemplo de teste;
+credenciais federadas ou certificados são preferíveis em produção. O cliente não imprime tokens,
+não segue redirects e não envia credenciais em URLs. HTTP sem TLS é permitido somente em loopback.
+
+O ingress continua interno por padrão. `external=false` permite acesso somente no mesmo
+ambiente ACA; não garante acesso de qualquer cliente da VNet. Em um ambiente ACA interno,
+`external=true` pode publicar no balanceador privado. Em ambiente externo, pode expor na
+internet. Escolher e validar DNS, rede e autorização explicitamente; a API não depende da UI.
+
+Referências: [OBO com Entra Agent ID](https://learn.microsoft.com/en-us/entra/agent-id/agent-on-behalf-of-oauth-flow),
+[permissões herdáveis](https://learn.microsoft.com/en-us/entra/agent-id/configure-inheritable-permissions-blueprints)
+e [MSAL Python](https://learn.microsoft.com/en-us/python/api/msal/msal.application.confidentialclientapplication).
+
+### Atualização de agentes existentes
+
+Publicar esta baseline não atualiza containers existentes nem cria grants. Para um novo
+provisionamento ou redeploy, preparar `API_ALLOWED_CLIENT_IDS` antes de disparar o workflow;
+uma lista ausente ou inválida interrompe o processo antes de criar recursos.
+
+1. Revisar consumidores do blueprint: esta versão usa tokens v2 e audiência do blueprint.
+2. Concluir o consentimento `Agent.Invoke` ou a atribuição `Agent.Invoke.Application` dos
+  clientes aprovados. No perfil OBO, preparar também `User.Read` e sua herança.
+3. Adaptar cada consumidor para enviar bearer token. O console atual não é compatível com
+  a nova API sem essa adaptação; não criar exceção anônima para contornar o requisito.
+4. Implantar uma revisão controlada na rede aprovada e testar acesso permitido e recusado.
+  Preservar a configuração Purview específica do agente; flags de repositório/environment
+  podem sobrescrever uma ativação feita diretamente em um deploy anterior.
+5. Manter a revisão anterior para rollback, considerando que versões antigas não possuem
+  autenticação na API. Não reverter para elas mantendo uma exposição externa recém-habilitada.
+
 ## Console autenticado
 
-O console web é uma superfície única para descobrir e invocar os agentes provisionados.
-Ele consulta Container Apps com a tag `a365-managed-by=agent-factory`, portanto novos agentes
-aparecem automaticamente.
+O console atual não encaminha um access token para o agente. Portanto, não invoca a nova
+API autenticada sem adaptação e consentimento próprios; receberá 401. Não confiar nos headers
+EasyAuth como substituto nem desabilitar a autenticação para mantê-lo funcionando. O cliente
+CLI acima fornece o caminho independente para validar esta evolução. O demo já implantado
+continua com sua revisão anterior até um redeploy explicitamente autorizado.
 
-O desenho de segurança utiliza:
+O console web é um cliente opcional de demonstração para descobrir e invocar agentes.
+Ele consulta Container Apps com a tag `a365-managed-by=agent-factory`, portanto novos agentes
+aparecem automaticamente. Descoberta não concede acesso à nova API.
+
+O deployment legado do console utiliza:
 
 - ingress externo somente no console;
 - ingress interno nos agentes;
@@ -553,6 +712,92 @@ No container, as variáveis são `PURVIEW_ENABLED`, `PURVIEW_AGENT_USER_ID`,
 com o recurso `https://graph.microsoft.com/.default`, em uma instância e cache separados
 do token de observabilidade. Não há fallback para a identidade humana ou outra aplicação.
 
+### Criar a política DLP para um agente
+
+**A política escolhe qual agente; a regra escolhe qual conteúdo bloquear.** O parâmetro
+`-Locations` de `New-DlpCompliancePolicy` recebe uma coleção de alvos. Dentro dela, o campo
+`Location` identifica a aplicação protegida. `LocationType=Individual` seleciona uma aplicação
+específica, não todas as aplicações do tenant.
+
+No fluxo padrão desta Factory, os identificadores têm os seguintes papéis:
+
+| Identificador | Papel na integração |
+|---|---|
+| `PURVIEW_APPLICATION_ID` | Alvo em `Location` da política e em `applicationLocation.value` de `processContent`; também enviado em `locations[].value` de `compute` |
+| `A365_AGENT_INSTANCE_ID` | ID da instância concreta do agente; é o valor padrão de `PURVIEW_APPLICATION_ID` nesta Factory |
+| `A365_BLUEPRINT_CLIENT_ID` | Identifica o blueprint e participa da autenticação; não é o alvo DLP padrão |
+| `PURVIEW_AGENT_USER_ID` | Contexto de avaliação em `/users/{AgentUserId}/...`; não substitui o alvo em `Location` |
+
+A Agent Identity é um tipo especializado de service principal no Entra. Neste desenho,
+usamos a identidade do próprio agente como aplicação protegida, não o app do console ou do
+pipeline. Se o deploy configurar outra aplicação protegida explicitamente, usar seu valor
+efetivo de `PURVIEW_APPLICATION_ID` também na política; não substituir por um ID arbitrário.
+
+Para aplicações Entra integradas às APIs Purview, a criação é feita por **Security & Compliance
+PowerShell**, com o módulo `ExchangeOnlineManagement` e uma conta autorizada a administrar DLP
+no tenant de destino. O assistente comum do portal não substitui esse fluxo. O exemplo abaixo
+cria uma **nova** política; não é necessário executá-lo em cada inicialização do agente.
+Substituir os placeholders, conferir o tenant conectado e escolher nomes ainda não utilizados.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$applicationId = '<PURVIEW_APPLICATION_ID-do-agente>'
+$policyName = 'DLP - Meu agente'
+$ruleName = 'DLP - Meu agente - Bloquear cartao'
+$null = [guid]::Parse($applicationId)
+
+Import-Module ExchangeOnlineManagement
+Connect-IPPSSession -UserPrincipalName '<administrador-do-tenant>'
+
+if (Get-DlpCompliancePolicy -Identity $policyName -ErrorAction SilentlyContinue) {
+  throw 'Politica ja existe. Revise a existente; nao a recrie automaticamente.'
+}
+
+$locations = ConvertTo-Json -InputObject @(@{
+  Workload            = 'Applications'
+  Location            = $applicationId
+  LocationDisplayName = 'Meu agente'
+  LocationSource      = 'Entra'
+  LocationType        = 'Individual'
+  Inclusions          = @(@{ Type = 'Tenant'; Identity = 'All' })
+}) -Depth 6 -Compress
+
+New-DlpCompliancePolicy -Name $policyName -Mode Enable `
+  -Locations $locations -EnforcementPlanes @('Application')
+
+New-DlpComplianceRule -Name $ruleName -Policy $policyName `
+  -ContentContainsSensitiveInformation @{ Name = 'Credit Card Number' } `
+  -RestrictAccess @(@{ setting = 'UploadText'; value = 'Block' })
+
+Get-DlpCompliancePolicy -Identity $policyName -DistributionDetail |
+  Format-List Name, Mode, DistributionStatus
+Get-DlpComplianceRule -Identity $ruleName |
+  Format-List Name, Disabled, ContentContainsSensitiveInformation, RestrictAccess
+```
+
+`Location = $applicationId` é a ligação com o agente específico. O `Tenant/All` de `Inclusions`
+inclui os contextos de usuário daquela aplicação, não todas as aplicações. Como a Factory
+avalia sempre seu Agent User fixo, uma política com inclusões mais restritas precisa cobrir
+esse contexto. A regra fica vinculada à política pelo parâmetro `-Policy`.
+
+O exemplo usa o tipo de informação sensível **Credit Card Number** e a ação **UploadText=Block**.
+Ajustar tipos, confiança e escopo conforme a política aprovada pela organização. Isso não
+concede permissões Graph, configura cobrança, cria política de coleta nem habilita o runtime.
+
+Depois da sincronização, usar a identidade e o Agent User do agente para confirmar que
+`protectionScopes/compute` retorna `evaluateInline` para `uploadText` e para o mesmo alvo.
+Comprovar conteúdo permitido e bloqueado por `processContent` antes de ativar a implantação.
+Na golden, prompt e retorno textual de ferramenta são avaliados como entrada do agente
+(`uploadText`); esse exemplo não habilita proteção adicional da resposta final (`downloadText`).
+
+A aplicação precisa consultar as APIs e cumprir a decisão de bloqueio: só registrar uma
+Enterprise App e criar a política não inspeciona o tráfego automaticamente. Um agente novo
+com outra identidade não entra no escopo individual desta política por usar a mesma golden
+ou o mesmo blueprint; seu alvo precisa estar coberto e validado.
+
+Referências: [criação da política e regra, exemplo 4](https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/new-dlpcompliancerule?view=exchange-ps#example-4)
+e [integração com as APIs Purview](https://learn.microsoft.com/en-us/purview/developer/use-the-api).
+
 ### Decisões e limites
 
 - `protectionScopes/compute` é armazenado em cache por até cinco minutos, isolado por cliente
@@ -581,6 +826,7 @@ Em um ambiente Python 3.12 isolado:
 
 ```bash
 python -m pip install -r template/agent/requirements.txt
+python -m pip install pyyaml jsonschema
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 

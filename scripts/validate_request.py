@@ -43,12 +43,17 @@ def check_policy(req: dict) -> list[Finding]:
     auth_mode = req.get("auth_mode")
     workiq = req.get("workiq_tools") or []
 
-    # WorkIQ exige token delegado de usuário. Com s2s não existe usuário no loop.
-    if workiq and auth_mode == "s2s":
+    if workiq:
         out.append(Finding(
             "erro",
-            f"workiq_tools está preenchido ({', '.join(workiq)}) mas auth_mode é 's2s'. "
-            "WorkIQ exige usuário no loop — use auth_mode 'obo' ou remova as ferramentas.",
+            "WorkIQ nao esta implementado neste runtime. O perfil OBO inicial oferece somente "
+            "a ferramenta de leitura Graph /me; remova workiq_tools ou use um runtime compativel.",
+        ))
+    if auth_mode == "obo" and req.get("autonomous"):
+        out.append(Finding(
+            "erro",
+            "OBO humano requer um access token de usuario em cada invocacao. "
+            "Execucao autonoma com user_fic ou refresh token nao esta implementada.",
         ))
 
     # O lab só provisiona Agent (não-teammate). AI Teammate precisa de Agentic User + licença.

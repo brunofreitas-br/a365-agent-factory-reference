@@ -3,8 +3,10 @@ import json
 import os
 import pathlib
 import sys
+import time
 import unittest
 from contextlib import ExitStack
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -337,7 +339,11 @@ class RuntimePolicyTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.dict(os.environ, {
-            "PURVIEW_ENABLED": "false", "LANGSMITH_TRACING": "false", "LANGCHAIN_TRACING_V2": "false"}))
+            "PURVIEW_ENABLED": "false", "LANGSMITH_TRACING": "false", "LANGCHAIN_TRACING_V2": "false",
+            "A365_TENANT_ID": "00000000-0000-4000-8000-000000000006",
+            "A365_BLUEPRINT_CLIENT_ID": BLUEPRINT_ID,
+            "API_ALLOWED_CLIENT_IDS": json.dumps([APPLICATION_ID]),
+            "API_AUTH_PROVIDER": "entra"}))
         self.stack.enter_context(patch.dict(sys.modules, {
             "purview": purview, "observability": SimpleNamespace(configure=Mock())}))
         original_read = pathlib.Path.read_text
@@ -359,8 +365,14 @@ class RuntimePolicyTests(unittest.TestCase):
             return module
 
         with patch.object(pathlib.Path, "read_text", autospec=True, side_effect=read_manifest):
+            authentication = load_module("authentication", "authentication.py")
+            load_module("delegation", "delegation.py")
             self.graph = load_module("graph", "graph.py")
             self.main = load_module("purview_runtime_test", "main.py")
+        self.caller = authentication.Caller(
+            "00000000-0000-4000-8000-000000000006", AGENT_USER_ID, APPLICATION_ID,
+            "user", 4102444800, "synthetic-user-assertion")
+        self.stack.enter_context(patch.object(self.main._auth, "authenticate_token", return_value=self.caller))
         self.policy = Mock(check_output=False)
         self.main._purview = self.policy
         self.main._graph = self.graph.build_graph(self.policy)
@@ -369,12 +381,125 @@ class RuntimePolicyTests(unittest.TestCase):
             content='{"category":"synthetic-category","urgency":"baixa"}', response_metadata={})
         self.model_factory = self.stack.enter_context(patch.object(self.graph, "_chat_model", return_value=self.model))
         self.client = self.stack.enter_context(TestClient(self.main.app))
+        self.client.headers["Authorization"] = "Bearer synthetic-client-token"
 
     def block_at(self, checkpoint, exception_type=purview.PurviewBlockedError):
         def evaluate(content, **context):
             if context["checkpoint"] == checkpoint:
                 raise exception_type("PURVIEW_DLP_BLOCKED")
         self.policy.check_text.side_effect = evaluate
+
+    def test_unauthenticated_invocation_stops_before_policy_and_model(self):
+        self.client.headers.pop("Authorization")
+        response = self.client.post("/invoke", json={"input": "synthetic input"})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["www-authenticate"], "Bearer")
+        self.policy.check_text.assert_not_called()
+        self.model_factory.assert_not_called()
+
+    def test_hosting_headers_do_not_replace_api_authentication(self):
+        self.client.headers.pop("Authorization")
+        response = self.client.post("/invoke", json={"input": "synthetic input"}, headers={
+            "X-MS-CLIENT-PRINCIPAL": "untrusted", "X-MS-TOKEN-AAD-ACCESS-TOKEN": "untrusted"})
+        self.assertEqual(response.status_code, 401)
+        self.policy.check_text.assert_not_called()
+        self.model_factory.assert_not_called()
+
+    def test_only_health_is_public(self):
+        self.client.headers.pop("Authorization")
+        self.assertEqual(self.client.get("/healthz").status_code, 200)
+        self.assertEqual(self.client.get("/manifest").status_code, 401)
+        self.assertEqual(self.client.get("/docs").status_code, 404)
+        self.assertEqual(self.client.get("/openapi.json").status_code, 404)
+
+    def test_invalid_forbidden_and_unavailable_auth_stop_before_processing(self):
+        for exception, status_code in (
+                (self.main.authentication.InvalidAuthentication, 401),
+                (self.main.authentication.ForbiddenCaller, 403),
+                (self.main.authentication.AuthenticationUnavailable, 503)):
+            with self.subTest(status=status_code):
+                self.main._auth.authenticate_token.side_effect = exception("private-token-detail")
+                response = self.client.post("/invoke", json={"input": "synthetic input"})
+                self.assertEqual(response.status_code, status_code)
+                self.assertNotIn("private-token-detail", response.text)
+        self.policy.check_text.assert_not_called()
+        self.model_factory.assert_not_called()
+
+    def test_direct_client_uses_signed_access_token_without_console(self):
+        import jwt
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.main._auth._keys = Mock()
+        self.main._auth._keys.get_signing_key_from_jwt.return_value = SimpleNamespace(key=key.public_key())
+        self.main._auth.authenticate_token.side_effect = lambda token: self.main.authentication.EntraAuthenticator.authenticate_token(self.main._auth, token)
+        now = int(time.time())
+        token = jwt.encode({
+            'aud': BLUEPRINT_ID, 'iss': self.main._auth.issuer, 'tid': self.main._auth.tenant_id,
+            'exp': now + 600, 'nbf': now - 10, 'iat': now - 10, 'ver': '2.0',
+            'oid': AGENT_USER_ID, 'sub': 'synthetic-user', 'azp': APPLICATION_ID, 'scp': 'Agent.Invoke',
+        }, key, algorithm='RS256', headers={'kid': 'synthetic-key'})
+        response = self.client.post('/invoke', json={'input': 'synthetic input'},
+                                    headers={'Authorization': f'Bearer {token}'})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(token, response.text)
+        self.assertNotIn(token, str(self.policy.check_text.call_args_list))
+
+    def test_obo_uses_verified_caller_and_preserves_policy_subject(self):
+        provider = Mock()
+        provider.read_profile.return_value = {'id': AGENT_USER_ID, 'displayName': 'Synthetic User'}
+        self.main._delegation = provider
+        response = self.client.post('/invoke', json={'input': 'synthetic input', 'userId': 'untrusted'})
+        self.assertEqual(response.status_code, 200)
+        provider.read_profile.assert_called_once_with(self.caller)
+        self.assertEqual([call.kwargs['checkpoint'] for call in self.policy.check_text.call_args_list],
+                         ['prompt', 'tool_response'])
+        self.assertNotIn(self.caller.user_assertion, response.text)
+        self.assertNotIn(self.caller.user_assertion, str(self.policy.check_text.call_args_list))
+
+    def test_obo_application_caller_stops_before_policy_and_model(self):
+        self.main._delegation = Mock()
+        self.main._auth.authenticate_token.return_value = replace(self.caller, kind='application', user_assertion=None)
+        response = self.client.post('/invoke', json={'input': 'synthetic input'})
+        self.assertEqual(response.status_code, 403)
+        self.main._delegation.read_profile.assert_not_called()
+        self.policy.check_text.assert_not_called()
+        self.model_factory.assert_not_called()
+
+    def test_obo_prompt_block_prevents_delegated_access(self):
+        self.main._delegation = Mock()
+        self.block_at('prompt')
+        response = self.client.post('/invoke', json={'input': 'sensitive input'})
+        self.assertEqual(response.status_code, 403)
+        self.main._delegation.read_profile.assert_not_called()
+        self.model_factory.assert_not_called()
+
+    def test_obo_tool_block_hides_delegated_profile(self):
+        self.main._delegation = Mock()
+        self.main._delegation.read_profile.return_value = {'displayName': 'sensitive-profile'}
+        self.block_at('tool_response')
+        response = self.client.post('/invoke', json={'input': 'synthetic input'})
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn('sensitive-profile', response.text)
+
+    def test_obo_challenge_is_returned_without_fallback(self):
+        self.main._delegation = Mock()
+        error = self.main.delegation.interaction_required('{"access_token":{"acrs":{"value":"c1"}}}')
+        self.main._delegation.read_profile.side_effect = error
+        response = self.client.post('/invoke', json={'input': 'synthetic input'})
+        self.assertEqual(response.status_code, 401)
+        self.assertIn('insufficient_claims', response.headers['WWW-Authenticate'])
+        self.main._delegation.read_profile.assert_called_once()
+
+    def test_obo_credentials_are_not_graph_state(self):
+        self.main._delegation = Mock()
+        with patch.object(self.main, 'build_graph') as factory:
+            factory.return_value.invoke.return_value = {
+                'output': 'synthetic output', 'category': 'synthetic', 'urgency': 'baixa', 'steps': []}
+            response = self.client.post('/invoke', json={'input': 'synthetic input'})
+        self.assertEqual(response.status_code, 200)
+        state = factory.return_value.invoke.call_args.args[0]
+        self.assertEqual(set(state), {'input', 'steps', 'correlation_id'})
+        self.assertNotIn(self.caller.user_assertion, str(state))
 
     def test_prompt_block_does_not_invoke_model_or_graph(self):
         self.block_at("prompt")

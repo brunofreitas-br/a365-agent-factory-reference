@@ -10,6 +10,8 @@ langchain-openai==0.2.14
 
 # Auth no Azure OpenAI por managed identity (sem API key)
 azure-identity==1.19.0
+PyJWT[crypto]==2.10.1
+msal==1.39.0
 
 # Observabilidade A365 (exportação OTLP para o endpoint S2S)
 opentelemetry-sdk==1.29.0

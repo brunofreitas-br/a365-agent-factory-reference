@@ -32,6 +32,7 @@ Token: GRAPH_TOKEN, ou o contexto do Azure CLI (em CI, o azure/login com o SP).
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import pathlib
@@ -42,6 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 GRAPH = "https://graph.microsoft.com"
 BETA = f"{GRAPH}/beta"
@@ -193,6 +195,60 @@ def ensure_blueprint(g: Graph, name: str, description: str, sponsor_id: str | No
     return created
 
 
+def api_configuration(blueprint: dict) -> dict:
+    app_id = str(uuid.UUID(blueprint['appId']))
+    api = copy.deepcopy(blueprint.get('api') or {})
+    scopes = api.setdefault('oauth2PermissionScopes', [])
+    existing_scope = next((scope for scope in scopes if scope.get('value') == 'Agent.Invoke'), None)
+    if existing_scope is not None:
+        if not existing_scope.get('isEnabled') or existing_scope.get('type') != 'Admin':
+            raise ValueError('Existing Agent.Invoke scope requires administrator review.')
+    else:
+        scopes.append({
+            'id': str(uuid.uuid5(uuid.UUID(app_id), 'Agent.Invoke.scope')),
+            'value': 'Agent.Invoke', 'type': 'Admin', 'isEnabled': True,
+            'adminConsentDisplayName': 'Invoke this agent',
+            'adminConsentDescription': 'Allow this client to invoke the agent on behalf of a signed-in user.',
+        })
+    api['requestedAccessTokenVersion'] = 2
+    roles = copy.deepcopy(blueprint.get('appRoles') or [])
+    existing_role = next((role for role in roles if role.get('value') == 'Agent.Invoke.Application'), None)
+    if existing_role is not None:
+        if not existing_role.get('isEnabled') or set(existing_role.get('allowedMemberTypes', [])) != {'Application'}:
+            raise ValueError('Existing Agent.Invoke.Application role requires administrator review.')
+    else:
+        roles.append({
+            'id': str(uuid.uuid5(uuid.UUID(app_id), 'Agent.Invoke.Application.role')),
+            'value': 'Agent.Invoke.Application', 'allowedMemberTypes': ['Application'], 'isEnabled': True,
+            'displayName': 'Invoke this agent', 'description': 'Invoke the agent as an authorized application.',
+        })
+    optional_claims = copy.deepcopy(blueprint.get('optionalClaims') or {})
+    access_claims = optional_claims.setdefault('accessToken', [])
+    if not any(claim.get('name') == 'idtyp' for claim in access_claims):
+        access_claims.append({'name': 'idtyp', 'source': None, 'essential': False, 'additionalProperties': []})
+    uris = list(blueprint.get('identifierUris') or [])
+    if f'api://{app_id}' not in uris:
+        uris.append(f'api://{app_id}')
+    return {'api': api, 'appRoles': roles, 'optionalClaims': optional_claims, 'identifierUris': uris}
+
+
+def ensure_api(g: Graph, blueprint: dict) -> None:
+    if g.dry_run:
+        print('  [dry-run] expose Agent.Invoke scope, Agent.Invoke.Application role and v2 API tokens')
+        return
+    url = f"{BETA}/applications/{blueprint['id']}/microsoft.graph.agentIdentityBlueprint"
+    status, current = g.call('GET', url + '?$select=id,appId,api,appRoles,optionalClaims,identifierUris')
+    if status != 200 or not isinstance(current, dict):
+        fail('Leitura do contrato da API', status, current)
+    desired = api_configuration(current)
+    changes = {name: value for name, value in desired.items() if current.get(name) != value}
+    if not changes:
+        return
+    status, body = g.call('PATCH', url, changes)
+    if status != 204:
+        fail('Configuracao do contrato da API', status, body)
+
+
 def ensure_service_principal(g: Graph, app_id: str) -> dict:
     """O principal do blueprint NÃO é um servicePrincipal comum.
 
@@ -319,6 +375,8 @@ def main() -> int:
                     help="ex: contoso.onmicrosoft.com — compõe o UPN do agent user")
     ap.add_argument("--secret-out", type=pathlib.Path,
                     help="Arquivo (modo 0600) onde gravar o segredo do blueprint")
+    ap.add_argument("--api-contract-out", type=pathlib.Path,
+                    help="Contrato de autenticacao sem credenciais para o consumidor da API")
     ap.add_argument("--skip-agent-user", action="store_true",
                     help="Só blueprint + identidade. Agent user consome licença.")
     ap.add_argument("--dry-run", action="store_true")
@@ -351,6 +409,7 @@ def main() -> int:
         wait_for("blueprint", lambda: g.get_one(odata_filter(
             f"{GRAPH}/v1.0/applications", f"appId eq '{blueprint_app_id}'", "&$select=id")))
 
+    ensure_api(g, blueprint)
     ensure_service_principal(g, blueprint_app_id)
 
     secret = None
@@ -388,6 +447,19 @@ def main() -> int:
     }
     print("\nResultado:")
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+    if args.api_contract_out:
+        contract = {
+            'audience': blueprint_app_id, 'tokenVersion': '2.0',
+            'delegatedScope': f'api://{blueprint_app_id}/Agent.Invoke',
+            'applicationScope': f'api://{blueprint_app_id}/.default',
+            'applicationRole': 'Agent.Invoke.Application', 'applicationTokenClaim': {'idtyp': 'app'},
+            'authMode': manifest.get('authMode', 's2s'),
+            'oboDownstreamScopes': ['https://graph.microsoft.com/User.Read']
+            if manifest.get('authMode') == 'obo' else [],
+        }
+        args.api_contract_out.parent.mkdir(parents=True, exist_ok=True)
+        args.api_contract_out.write_text(json.dumps(contract, indent=2), encoding='utf-8')
 
     if secret and args.secret_out:
         args.secret_out.parent.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import re
+from collections.abc import Callable
 from functools import partial
 from typing import Annotated, Literal, TypedDict
 
@@ -94,14 +95,19 @@ def classify(state: AgentState, *, purview_client: PurviewPolicyClient | None = 
         return {"category": category, "urgency": urgency, "steps": ["classify"]}
 
 
-def act(state: AgentState, *, purview_client: PurviewPolicyClient | None = None) -> dict:
+def act(state: AgentState, *, purview_client: PurviewPolicyClient | None = None,
+    profile_reader: Callable[[], dict] | None = None) -> dict:
     """Onde o efeito colateral aconteceria. Só grava se o manifesto permitir escrita."""
     with tracer.start_as_current_span("act") as span:
         span.set_attribute("gen_ai.operation.name", "execute_tool")
-        span.set_attribute("gen_ai.tool.name", "registrar_classificacao")
+        span.set_attribute("gen_ai.tool.name", "graph_me" if profile_reader is not None else "registrar_classificacao")
         span.set_attribute("a365.writes_allowed", MANIFEST["writes"])
 
-        if not MANIFEST["writes"]:
+        if profile_reader is not None:
+            profile = profile_reader()
+            output = json.dumps({"category": state["category"], "urgency": state["urgency"],
+                                 "delegatedProfile": profile}, ensure_ascii=False)
+        elif not MANIFEST["writes"]:
             span.set_attribute("a365.write_skipped", True)
             output = (f"Classificado como {state['category']} "
                       f"(urgência {state['urgency']}). Escrita não autorizada pelo manifesto.")
@@ -119,10 +125,11 @@ def act(state: AgentState, *, purview_client: PurviewPolicyClient | None = None)
         return result
 
 
-def build_graph(purview_client: PurviewPolicyClient | None = None):
+def build_graph(purview_client: PurviewPolicyClient | None = None, *,
+                profile_reader: Callable[[], dict] | None = None):
     graph = StateGraph(AgentState)
     graph.add_node("classify", partial(classify, purview_client=purview_client))
-    graph.add_node("act", partial(act, purview_client=purview_client))
+    graph.add_node("act", partial(act, purview_client=purview_client, profile_reader=profile_reader))
     graph.add_edge(START, "classify")
     graph.add_edge("classify", "act")
     graph.add_edge("act", END)

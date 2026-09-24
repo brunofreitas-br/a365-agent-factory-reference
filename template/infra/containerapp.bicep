@@ -54,6 +54,10 @@ param a365AgentInstanceId string
 @description('Client ID do blueprint do agente')
 param a365BlueprintClientId string
 
+@description('Client IDs autorizados a invocar a API. Exige scope Agent.Invoke ou app role Agent.Invoke.Application, conforme o tipo de chamador.')
+@minLength(1)
+param apiAllowedClientIds string[]
+
 type purviewConfiguration = {
   enabled: bool
   agentUserId: string
@@ -79,7 +83,7 @@ param azureOpenAiEndpoint string
 @description('Nome do deployment do Azure OpenAI')
 param azureOpenAiDeployment string
 
-@description('Expõe o agente na internet. Padrão false: em produção quem chama é o gateway MCP governado. Use true apenas no lab, para conseguir testar de fora.')
+@description('Publica a aplicacao fora do mesmo ambiente ACA. A exposicao publica ou privada depende da rede do ambiente. A API sempre exige autenticacao.')
 param externalIngress bool = false
 
 param location string = resourceGroup().location
@@ -141,6 +145,8 @@ resource agentApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'A365_AGENT_INSTANCE_ID', value: a365AgentInstanceId }
             { name: 'A365_BLUEPRINT_CLIENT_ID', value: a365BlueprintClientId }
             { name: 'A365_BLUEPRINT_CLIENT_SECRET', secretRef: 'blueprint-client-secret' }
+            { name: 'API_AUTH_PROVIDER', value: 'entra' }
+            { name: 'API_ALLOWED_CLIENT_IDS', value: string(apiAllowedClientIds) }
             { name: 'PURVIEW_ENABLED', value: string(purview.enabled) }
             { name: 'PURVIEW_AGENT_USER_ID', value: purview.agentUserId }
             { name: 'PURVIEW_APPLICATION_ID', value: empty(purview.applicationId) ? a365AgentInstanceId : purview.applicationId }
